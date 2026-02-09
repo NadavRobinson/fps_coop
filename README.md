@@ -8,6 +8,16 @@ Prototype FPS arena app built as a native desktop Python app (`tkinter`, no brow
 python fps_bot_arena.py
 ```
 
+## Project Structure
+
+- `fps_bot_arena.py`: compatibility launcher
+- `fps_arena/main.py`: CLI entrypoint + startup
+- `fps_arena/app.py`: main game app class and loop
+- `fps_arena/network.py`: host/client networking
+- `fps_arena/models.py`: dataclasses and shared state models
+- `fps_arena/config.py`: constants and static game data
+- `fps_arena/utils.py`: math/render helpers
+
 ## Controls
 
 - `W/A/S/D`: move
@@ -15,8 +25,11 @@ python fps_bot_arena.py
 - `Left Click` (hold): fire
 - `B`: toggle real-time shop/inventory wheel (also unlocks/locks cursor)
 - `1/2/3/4`: quick buy or switch weapons
-- `Esc`: quit
+- `Esc`: open/close pause + settings menu (mouse sensitivity, fullscreen, resolution, FOV, FPS cap)
 - `R`: restart after death or glitch ending
+
+Settings are persisted to `~/.fps_bot_arena_settings.json`.
+Mouse smoothing is enabled by default and can be toggled in the ESC menu.
 
 ## Gameplay Loop
 
