@@ -23,20 +23,26 @@ python fps_bot_arena.py
 - `W/A/S/D`: move
 - `Mouse`: look (cursor is hidden + locked to game window while playing)
 - `Left Click` (hold): fire
+- `Middle/Right Click` or `Q`: team ping marker
 - `B`: toggle real-time shop/inventory wheel (also unlocks/locks cursor)
 - `1/2/3/4`: quick buy or switch weapons
+- `R`: reload while alive
+- `F1/F2/F3/F4`: spend perk points (vitality/mobility/regen/weapon)
 - `Esc`: open/close pause + settings menu (mouse sensitivity, fullscreen, resolution, FOV, FPS cap)
-- `R`: restart after death or glitch ending
+- `R`: restart after death or glitch ending (when dead/bsod)
 
 Settings are persisted to `~/.fps_bot_arena_settings.json`.
+Progress/perks are persisted to `~/.fps_bot_arena_profile.json`.
 Mouse smoothing is enabled by default and can be toggled in the ESC menu.
 
 ## Gameplay Loop
 
-- Start with pistol and survive waves of tactical bots.
-- Health regenerates slowly after 4 seconds without taking damage.
-- Bots drop physical money pickups.
-- Buy stronger weapons via the shop wheel.
+- Start with pistol and survive waves of tactical bots and objective waves.
+- Bot archetypes include flankers, tanks, sharpshooters, and periodic bosses.
+- Health regenerates slowly after 4 seconds without taking damage (boostable via perks).
+- Bots drop physical money pickups (split or shared money mode in co-op).
+- Buy stronger weapons via the shop wheel, reload magazines, and land headshots for bonus damage.
+- Earn XP, level up, spend perk points, and unlock attachment tiers.
 - Buying and firing the RPG triggers the fake crash ending.
 
 

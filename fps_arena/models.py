@@ -12,6 +12,7 @@ class Bot:
     y: float
     health: float
     speed: float
+    kind: str = "grunt"
     fire_cooldown: float = 0.0
     ai_cooldown: float = 0.0
     target_x: float = 0.0
@@ -19,6 +20,11 @@ class Bot:
     state: str = "advance"
     alive: bool = True
     radius: float = 0.28
+    attack_range: float = 11.5
+    hit_bonus: float = 0.0
+    damage_min: int = 4
+    damage_max: int = 9
+    money_multiplier: float = 1.0
 
 
 @dataclass
@@ -41,10 +47,14 @@ class RemotePlayer:
     current_weapon: str = "pistol"
     owned_weapons: dict[str, bool] = field(default_factory=lambda: make_owned_weapons())
     ammo: dict[str, int] = field(default_factory=lambda: make_ammo())
+    clip: dict[str, int] = field(default_factory=lambda: make_clip())
     next_fire_at: float = 0.0
     time_since_damage: float = 0.0
     keys: set[str] = field(default_factory=set)
     shooting: bool = False
+    downed: bool = False
+    bleed_out: float = 0.0
+    revive_progress: float = 0.0
 
 
 @dataclass
@@ -56,6 +66,7 @@ class TeammateView:
     angle: float
     health: float
     weapon: str
+    downed: bool = False
 
 
 @dataclass
@@ -87,3 +98,7 @@ def make_ammo() -> dict[str, int]:
         "rifle": 0,
         "rpg": 0,
     }
+
+
+def make_clip() -> dict[str, int]:
+    return {weapon: int(WEAPON_DATA[weapon]["mag_size"]) for weapon in WEAPON_ORDER}

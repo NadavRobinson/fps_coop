@@ -12,6 +12,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 from .config import (
+    BOT_ARCHETYPES,
     DEFAULT_FOV_DEG,
     DEFAULT_FPS_LIMIT,
     DEFAULT_HEIGHT,
@@ -50,6 +51,7 @@ MOUSE_WARP_EDGE_MARGIN = 140
 MOUSE_WARP_INTERVAL_SECONDS = 1.0 / 90.0
 
 SETTINGS_FILE_PATH = Path.home() / ".fps_bot_arena_settings.json"
+PROFILE_FILE_PATH = Path.home() / ".fps_bot_arena_profile.json"
 
 HAS_MACOS_CURSOR_WARP = False
 _macos_app_services = None
@@ -71,6 +73,13 @@ HEIGHT = DEFAULT_HEIGHT
 HALF_HEIGHT = HEIGHT // 2
 FOV = math.radians(DEFAULT_FOV_DEG)
 RAY_COUNT = max(160, min(MAX_RAY_COUNT, int(WIDTH / RAY_DENSITY)))
+
+RECOIL_PATTERNS = {
+    "pistol": [0.0, 0.004, -0.003, 0.005, -0.004, 0.003],
+    "shotgun": [0.0, -0.008, 0.007, -0.005],
+    "rifle": [0.0, 0.003, -0.002, 0.004, -0.003, 0.002, 0.003, -0.002],
+    "rpg": [0.0],
+}
 
 class FPSBotArena:
     def __init__(
@@ -151,6 +160,7 @@ class FPSBotArena:
 
     def _init_input_and_settings_state(self) -> None:
         self.settings_path = SETTINGS_FILE_PATH
+        self.profile_path = PROFILE_FILE_PATH
         self.keys: set[str] = set()
         self.mouse_down = False
         self.last_mouse_x = WIDTH // 2
@@ -169,10 +179,35 @@ class FPSBotArena:
         self.smoothed_mouse_dx = 0.0
         self.use_warp_mouse = HAS_WIN32 or HAS_MACOS_CURSOR_WARP
         self.next_warp_allowed_at = 0.0
+        self.last_damage_from = 0.0
+        self.damage_direction_timer = 0.0
+        self.team_ping: tuple[float, float, float, str] | None = None
+        self.shared_money = False
+        self.objective_type = "eliminate"
+        self.objective_timer = 0.0
+        self.objective_zone: tuple[float, float, float] | None = None
+        self.current_reload_weapon: str | None = None
+        self.reload_end_at = 0.0
+        self.spread_heat = 0.0
+        self.recoil_index = {weapon: 0 for weapon in WEAPON_ORDER}
+        self.clip = {weapon: int(WEAPON_DATA[weapon]["mag_size"]) for weapon in WEAPON_ORDER}
+        self.adaptive_quality_enabled = True
+        self.frame_dt_avg = 1.0 / 60.0
+        self.last_quality_adjust = 0.0
+        self.base_ray_target = RAY_COUNT
+        self.profile_level = 1
+        self.profile_xp = 0
+        self.perk_points = 0
+        self.attachment_tier = 0
+        self.perks = {"vitality": 0, "mobility": 0, "regen": 0, "weapon": 0}
+        self.remote_interp_targets: dict[str, tuple[float, float, float, float, str, bool, str]] = {}
+        self.remote_render_map: dict[str, TeammateView] = {}
+        self.wave_cleared_award_pending = False
 
         self.mouse_locked = True
         self.focused = True
 
+        self.load_profile()
         self.load_user_settings()
         self.apply_fov_setting()
         self.apply_display_settings()
@@ -182,6 +217,8 @@ class FPSBotArena:
         self.root.bind("<KeyRelease>", self.on_key_up)
         self.root.bind("<Motion>", self.on_mouse_move)
         self.root.bind("<ButtonPress-1>", self.on_mouse_down)
+        self.root.bind("<ButtonPress-2>", self.on_mouse_down)
+        self.root.bind("<ButtonPress-3>", self.on_mouse_down)
         self.root.bind("<ButtonRelease-1>", self.on_mouse_up)
         self.root.bind("<FocusIn>", self.on_focus_in)
         self.root.bind("<FocusOut>", self.on_focus_out)
@@ -193,17 +230,31 @@ class FPSBotArena:
         self.player_x = 2.6
         self.player_y = 2.6
         self.player_angle = 0.15
-        self.player_health = 100.0
+        self.player_health = self.get_max_health_cap()
         self.player_money = 0
+        self.player_downed = False
+        self.player_bleed_out = 0.0
+        self.player_revive_progress = 0.0
 
         self.owned_weapons = make_owned_weapons()
         self.ammo = make_ammo()
+        self.clip = {weapon: 0 for weapon in WEAPON_ORDER}
+        self.clip["pistol"] = int(WEAPON_DATA["pistol"]["mag_size"])
         self.current_weapon = "pistol"
         self.next_fire_at = 0.0
+        self.current_reload_weapon = None
+        self.reload_end_at = 0.0
+        self.spread_heat = 0.0
+        self.recoil_index = {weapon: 0 for weapon in WEAPON_ORDER}
 
         self.shop_open = False
         self.wave = 0
         self.wave_timer = 0.0
+        self.wave_cleared_award_pending = False
+        self.objective_type = "eliminate"
+        self.objective_timer = 0.0
+        self.objective_zone = None
+        self.team_ping = None
 
         self.bots: list[Bot] = []
         self.money_drops: list[MoneyDrop] = []
@@ -216,6 +267,8 @@ class FPSBotArena:
         self.time_since_damage = 0.0
 
         self.remote_render_players = []
+        self.remote_render_map.clear()
+        self.remote_interp_targets.clear()
         if self.net_mode == "host":
             for remote in self.remote_players.values():
                 spawn_x, spawn_y = self.pick_spawn_far_from_point(self.player_x, self.player_y, 4.5)
@@ -227,10 +280,15 @@ class FPSBotArena:
                 remote.current_weapon = "pistol"
                 remote.owned_weapons = make_owned_weapons()
                 remote.ammo = make_ammo()
+                remote.clip = {weapon: 0 for weapon in WEAPON_ORDER}
+                remote.clip["pistol"] = int(WEAPON_DATA["pistol"]["mag_size"])
                 remote.next_fire_at = 0.0
                 remote.time_since_damage = 0.0
                 remote.keys.clear()
                 remote.shooting = False
+                remote.downed = False
+                remote.bleed_out = 0.0
+                remote.revive_progress = 0.0
 
         if self.net_mode != "client":
             self.spawn_wave()
@@ -272,7 +330,8 @@ class FPSBotArena:
         WIDTH = width
         HEIGHT = height
         HALF_HEIGHT = HEIGHT // 2
-        RAY_COUNT = max(160, min(MAX_RAY_COUNT, int(WIDTH / RAY_DENSITY)))
+        self.base_ray_target = max(160, min(MAX_RAY_COUNT, int(WIDTH / RAY_DENSITY)))
+        RAY_COUNT = self.base_ray_target
         self.canvas.configure(width=WIDTH, height=HEIGHT)
         self.last_mouse_x = min(self.last_mouse_x, WIDTH - 1)
         self.last_mouse_y = min(self.last_mouse_y, HEIGHT - 1)
@@ -311,6 +370,8 @@ class FPSBotArena:
         self.mouse_smoothing_enabled = DEFAULT_MOUSE_SMOOTHING_ENABLED
         self.fov_degrees = DEFAULT_FOV_DEG
         self.fps_limit = DEFAULT_FPS_LIMIT
+        self.shared_money = False
+        self.adaptive_quality_enabled = True
         self.apply_fov_setting()
         self.fullscreen_enabled = False
         self.resolution_index = self.find_resolution_index(DEFAULT_WIDTH, DEFAULT_HEIGHT)
@@ -334,6 +395,14 @@ class FPSBotArena:
         smoothing = payload.get("mouse_smoothing_enabled")
         if isinstance(smoothing, bool):
             self.mouse_smoothing_enabled = smoothing
+
+        shared_money = payload.get("shared_money")
+        if isinstance(shared_money, bool):
+            self.shared_money = shared_money
+
+        adaptive_quality = payload.get("adaptive_quality_enabled")
+        if isinstance(adaptive_quality, bool):
+            self.adaptive_quality_enabled = adaptive_quality
 
         fov_deg = payload.get("fov_degrees")
         if isinstance(fov_deg, (float, int)):
@@ -361,6 +430,8 @@ class FPSBotArena:
         payload = {
             "mouse_sensitivity": round(self.mouse_sensitivity, 4),
             "mouse_smoothing_enabled": bool(self.mouse_smoothing_enabled),
+            "shared_money": bool(self.shared_money),
+            "adaptive_quality_enabled": bool(self.adaptive_quality_enabled),
             "fov_degrees": int(self.fov_degrees),
             "fps_limit": int(self.fps_limit),
             "fullscreen_enabled": bool(self.fullscreen_enabled),
@@ -370,6 +441,89 @@ class FPSBotArena:
             self.settings_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except OSError:
             pass
+
+    def load_profile(self) -> None:
+        try:
+            raw = self.profile_path.read_text(encoding="utf-8")
+            payload = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            return
+
+        if not isinstance(payload, dict):
+            return
+
+        self.profile_level = max(1, int(payload.get("level", self.profile_level)))
+        self.profile_xp = max(0, int(payload.get("xp", self.profile_xp)))
+        self.perk_points = max(0, int(payload.get("perk_points", self.perk_points)))
+        self.attachment_tier = max(0, int(payload.get("attachment_tier", self.attachment_tier)))
+
+        perks = payload.get("perks")
+        if isinstance(perks, dict):
+            for key in self.perks.keys():
+                value = perks.get(key)
+                if isinstance(value, int):
+                    self.perks[key] = max(0, min(8, value))
+
+    def save_profile(self) -> None:
+        payload = {
+            "level": int(self.profile_level),
+            "xp": int(self.profile_xp),
+            "perk_points": int(self.perk_points),
+            "attachment_tier": int(self.attachment_tier),
+            "perks": dict(self.perks),
+        }
+        try:
+            self.profile_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def xp_to_next_level(self) -> int:
+        return 100 + self.profile_level * 65
+
+    def gain_xp(self, amount: int) -> None:
+        if amount <= 0:
+            return
+        self.profile_xp += amount
+        leveled = False
+        while self.profile_xp >= self.xp_to_next_level():
+            self.profile_xp -= self.xp_to_next_level()
+            self.profile_level += 1
+            self.perk_points += 1
+            leveled = True
+            if self.profile_level % 3 == 0:
+                self.attachment_tier += 1
+        if leveled:
+            self.net_status = f"Level up! L{self.profile_level} | Perk points: {self.perk_points}"
+        self.save_profile()
+
+    def apply_perk_choice(self, perk_key: str) -> None:
+        if self.perk_points <= 0:
+            return
+        if perk_key not in self.perks:
+            return
+        if self.perks[perk_key] >= 8:
+            return
+        self.perks[perk_key] += 1
+        self.perk_points -= 1
+        self.save_profile()
+
+    def get_max_health_cap(self) -> float:
+        return 100.0 + self.perks["vitality"] * 10.0
+
+    def get_move_speed_multiplier(self) -> float:
+        return 1.0 + self.perks["mobility"] * 0.05
+
+    def get_regen_multiplier(self) -> float:
+        return 1.0 + self.perks["regen"] * 0.14
+
+    def get_weapon_damage_multiplier(self) -> float:
+        return 1.0 + self.perks["weapon"] * 0.06 + self.attachment_tier * 0.02
+
+    def get_spread_multiplier(self) -> float:
+        return max(0.6, 1.0 - self.attachment_tier * 0.03)
+
+    def get_recoil_multiplier(self) -> float:
+        return max(0.65, 1.0 - self.attachment_tier * 0.025)
 
     def _build_floor_cells(self) -> None:
         self.floor_cells: list[tuple[int, int]] = []
@@ -453,13 +607,16 @@ class FPSBotArena:
             player_id = event.get("player_id", "")
             if evt == "connect":
                 spawn_x, spawn_y = self.pick_spawn_far_from_point(self.player_x, self.player_y, 6.0)
-                self.remote_players[player_id] = RemotePlayer(
+                remote = RemotePlayer(
                     player_id=player_id,
                     name=f"Teammate {player_id}",
                     x=spawn_x,
                     y=spawn_y,
                     angle=random.uniform(0.0, math.tau),
                 )
+                remote.clip = {weapon: 0 for weapon in WEAPON_ORDER}
+                remote.clip["pistol"] = int(WEAPON_DATA["pistol"]["mag_size"])
+                self.remote_players[player_id] = remote
             elif evt == "disconnect":
                 self.remote_players.pop(player_id, None)
             elif evt == "message":
@@ -474,7 +631,7 @@ class FPSBotArena:
                     if name:
                         remote.name = name[:18]
                 elif msg_type == "input":
-                    allowed = {"w", "a", "s", "d", "shift_l", "shift_r", "left", "right"}
+                    allowed = {"w", "a", "s", "d", "shift_l", "shift_r", "left", "right", "e", "r", "q"}
                     remote.keys = {k for k in message.get("keys", []) if k in allowed}
                     try:
                         remote.angle = normalize_angle(float(message.get("angle", remote.angle)))
@@ -517,6 +674,7 @@ class FPSBotArena:
         self.player_y = float(you.get("y", self.player_y))
         self.player_angle = normalize_angle(float(you.get("angle", self.player_angle)))
         self.player_health = float(you.get("health", self.player_health))
+        self.player_downed = bool(you.get("downed", self.player_downed))
         self.player_money = int(you.get("money", self.player_money))
         self.current_weapon = str(you.get("weapon", self.current_weapon))
 
@@ -526,6 +684,12 @@ class FPSBotArena:
                 if weapon in ammo_data:
                     self.ammo[weapon] = int(ammo_data[weapon])
 
+        clip_data = you.get("clip")
+        if isinstance(clip_data, dict):
+            for weapon in WEAPON_ORDER:
+                if weapon in clip_data:
+                    self.clip[weapon] = int(clip_data[weapon])
+
         owned_data = you.get("owned")
         if isinstance(owned_data, dict):
             for weapon in WEAPON_ORDER:
@@ -534,6 +698,31 @@ class FPSBotArena:
 
         self.wave = int(payload.get("wave", self.wave))
         self.game_state = str(payload.get("game_state", self.game_state))
+        self.objective_type = str(payload.get("objective_type", self.objective_type))
+        self.objective_timer = float(payload.get("objective_timer", self.objective_timer))
+        self.shared_money = bool(payload.get("shared_money", self.shared_money))
+        zone = payload.get("objective_zone")
+        if isinstance(zone, (list, tuple)) and len(zone) == 3:
+            try:
+                self.objective_zone = (float(zone[0]), float(zone[1]), float(zone[2]))
+            except (TypeError, ValueError):
+                self.objective_zone = None
+        elif zone is None:
+            self.objective_zone = None
+
+        ping = payload.get("ping")
+        if isinstance(ping, dict):
+            try:
+                self.team_ping = (
+                    float(ping.get("x", 0.0)),
+                    float(ping.get("y", 0.0)),
+                    float(ping.get("ttl", 0.0)),
+                    str(ping.get("owner", "TEAM")),
+                )
+            except (TypeError, ValueError):
+                self.team_ping = None
+        elif ping is None:
+            self.team_ping = None
 
         self.bots = []
         for item in payload.get("bots", []):
@@ -542,9 +731,15 @@ class FPSBotArena:
                     x=float(item.get("x", 0.0)),
                     y=float(item.get("y", 0.0)),
                     health=float(item.get("health", 100.0)),
-                    speed=1.2,
+                    speed=float(item.get("speed", 1.2)),
+                    kind=str(item.get("kind", "grunt")),
                     state=str(item.get("state", "advance")),
                     alive=bool(item.get("alive", True)),
+                    attack_range=float(item.get("attack_range", 11.5)),
+                    hit_bonus=float(item.get("hit_bonus", 0.0)),
+                    damage_min=int(item.get("damage_min", 4)),
+                    damage_max=int(item.get("damage_max", 9)),
+                    money_multiplier=float(item.get("money_multiplier", 1.0)),
                 )
             )
 
@@ -559,24 +754,54 @@ class FPSBotArena:
                 )
             )
 
-        self.remote_render_players = []
+        seen: set[str] = set()
         for item in payload.get("players", []):
             player_id = str(item.get("id", ""))
             if player_id == self.player_id:
                 continue
-            self.remote_render_players.append(
-                TeammateView(
-                    player_id=player_id,
-                    name=str(item.get("name", "Teammate")),
-                    x=float(item.get("x", 0.0)),
-                    y=float(item.get("y", 0.0)),
-                    angle=float(item.get("angle", 0.0)),
-                    health=float(item.get("health", 0.0)),
-                    weapon=str(item.get("weapon", "pistol")),
-                )
-            )
+            tx = float(item.get("x", 0.0))
+            ty = float(item.get("y", 0.0))
+            ta = float(item.get("angle", 0.0))
+            th = float(item.get("health", 0.0))
+            tw = str(item.get("weapon", "pistol"))
+            tn = str(item.get("name", "Teammate"))
+            td = bool(item.get("downed", False))
+            self.remote_interp_targets[player_id] = (tx, ty, ta, th, tw, td, tn)
+            view = self.remote_render_map.get(player_id)
+            if view is None:
+                view = TeammateView(player_id=player_id, name=tn, x=tx, y=ty, angle=ta, health=th, weapon=tw, downed=td)
+                self.remote_render_map[player_id] = view
+            seen.add(player_id)
+
+        for player_id in list(self.remote_render_map.keys()):
+            if player_id not in seen:
+                self.remote_render_map.pop(player_id, None)
+                self.remote_interp_targets.pop(player_id, None)
+
+        self.remote_render_players = list(self.remote_render_map.values())
 
         self.net_status = f"Connected teammates: {len(self.remote_render_players)}"
+
+    def update_remote_interpolation(self, dt: float) -> None:
+        if self.net_mode != "client":
+            return
+        blend = clamp(dt * 10.0, 0.0, 1.0)
+        for player_id, view in self.remote_render_map.items():
+            target = self.remote_interp_targets.get(player_id)
+            if target is None:
+                continue
+            tx, ty, ta, th, tw, td, tn = target
+            view.x += (tx - view.x) * blend
+            view.y += (ty - view.y) * blend
+            da = normalize_angle(ta - view.angle)
+            if da > math.pi:
+                da -= math.tau
+            view.angle = normalize_angle(view.angle + da * blend)
+            view.health = th
+            view.weapon = tw
+            view.name = tn
+            view.downed = td
+        self.remote_render_players = list(self.remote_render_map.values())
 
     def send_client_input(self, now: float) -> None:
         if self.coop_client is None or not self.client_connected:
@@ -585,7 +810,7 @@ class FPSBotArena:
             return
 
         self.last_net_send = now
-        allowed = ["w", "a", "s", "d", "shift_l", "shift_r", "left", "right"]
+        allowed = ["w", "a", "s", "d", "shift_l", "shift_r", "left", "right", "e", "r", "q"]
         pressed = [key for key in allowed if key in self.keys]
         self.coop_client.send(
             {
@@ -596,6 +821,7 @@ class FPSBotArena:
                     self.mouse_down
                     and not self.shop_open
                     and not self.pause_open
+                    and not self.player_downed
                     and self.game_state == "playing"
                 ),
             }
@@ -609,9 +835,11 @@ class FPSBotArena:
             "y": remote.y,
             "angle": remote.angle,
             "health": remote.health,
+            "downed": remote.downed,
             "money": remote.money,
             "weapon": remote.current_weapon,
             "ammo": dict(remote.ammo),
+            "clip": dict(remote.clip),
             "owned": dict(remote.owned_weapons),
         }
 
@@ -623,9 +851,11 @@ class FPSBotArena:
             "y": self.player_y,
             "angle": self.player_angle,
             "health": self.player_health,
+            "downed": self.player_downed,
             "money": self.player_money,
             "weapon": self.current_weapon,
             "ammo": dict(self.ammo),
+            "clip": dict(self.clip),
             "owned": dict(self.owned_weapons),
         }
 
@@ -638,11 +868,32 @@ class FPSBotArena:
 
         players = [self.serialize_local()] + [self.serialize_remote(p) for p in self.remote_players.values()]
         bots = [
-            {"x": b.x, "y": b.y, "health": b.health, "state": b.state, "alive": b.alive}
+            {
+                "x": b.x,
+                "y": b.y,
+                "health": b.health,
+                "speed": b.speed,
+                "kind": b.kind,
+                "state": b.state,
+                "alive": b.alive,
+                "attack_range": b.attack_range,
+                "hit_bonus": b.hit_bonus,
+                "damage_min": b.damage_min,
+                "damage_max": b.damage_max,
+                "money_multiplier": b.money_multiplier,
+            }
             for b in self.bots
             if b.alive
         ]
         drops = [{"x": d.x, "y": d.y, "value": d.value, "ttl": d.ttl} for d in self.money_drops]
+        ping = None
+        if self.team_ping is not None:
+            ping = {
+                "x": self.team_ping[0],
+                "y": self.team_ping[1],
+                "ttl": self.team_ping[2],
+                "owner": self.team_ping[3],
+            }
 
         for remote in self.remote_players.values():
             payload = {
@@ -654,6 +905,11 @@ class FPSBotArena:
                 "drops": drops,
                 "wave": self.wave,
                 "game_state": self.game_state,
+                "objective_type": self.objective_type,
+                "objective_timer": self.objective_timer,
+                "objective_zone": self.objective_zone,
+                "shared_money": self.shared_money,
+                "ping": ping,
             }
             self.coop_server.send(remote.player_id, payload)
 
@@ -672,10 +928,25 @@ class FPSBotArena:
         remote.money -= config["cost"]
         remote.owned_weapons[weapon] = True
         remote.ammo[weapon] += config["ammo_pack"]
+        if remote.clip[weapon] <= 0 and not config["infinite"]:
+            needed = int(config["mag_size"])
+            loaded = min(needed, remote.ammo[weapon])
+            remote.clip[weapon] += loaded
+            remote.ammo[weapon] -= loaded
         remote.current_weapon = weapon
+        remote.revive_progress = 0.0
 
     def update_remote_players(self, dt: float, now: float) -> None:
         for remote in self.remote_players.values():
+            if remote.downed:
+                if "e" in remote.keys and self.player_downed and distance(remote.x, remote.y, self.player_x, self.player_y) <= 1.7:
+                    self.player_revive_progress += dt
+                    if self.player_revive_progress >= 2.3:
+                        self.player_downed = False
+                        self.player_bleed_out = 0.0
+                        self.player_revive_progress = 0.0
+                        self.player_health = 40.0
+                continue
             if remote.health <= 0:
                 continue
 
@@ -718,23 +989,31 @@ class FPSBotArena:
             if remote.health < 100.0 and remote.time_since_damage >= HEALTH_REGEN_DELAY:
                 remote.health = min(100.0, remote.health + HEALTH_REGEN_RATE * dt)
 
+            if "q" in remote.keys:
+                self.team_ping = (remote.x, remote.y, 5.5, remote.name)
+
             self.handle_remote_shooting(remote, now)
 
     def handle_remote_shooting(self, remote: RemotePlayer, now: float) -> None:
-        if not remote.shooting or remote.health <= 0:
+        if not remote.shooting or remote.health <= 0 or remote.downed:
             return
         if now < remote.next_fire_at:
             return
 
         weapon = remote.current_weapon
         config = WEAPON_DATA[weapon]
-        if not config["infinite"] and remote.ammo[weapon] <= 0:
+        if not config["infinite"] and remote.clip[weapon] <= 0:
+            needed = int(config["mag_size"])
+            loaded = min(needed, remote.ammo[weapon])
+            remote.clip[weapon] += loaded
+            remote.ammo[weapon] -= loaded
+        if not config["infinite"] and remote.clip[weapon] <= 0:
             remote.current_weapon = "pistol"
             return
 
         remote.next_fire_at = now + config["fire_rate"]
         if not config["infinite"]:
-            remote.ammo[weapon] = max(0, remote.ammo[weapon] - 1)
+            remote.clip[weapon] = max(0, remote.clip[weapon] - 1)
 
         if weapon == "rpg":
             self.game_state = "glitch"
@@ -743,21 +1022,21 @@ class FPSBotArena:
 
         for _ in range(config["pellets"]):
             shot_angle = remote.angle + random.uniform(-config["spread"], config["spread"])
-            target = self.get_first_bot_hit_from(remote.x, remote.y, shot_angle, config["range"])
+            target, _ = self.get_first_bot_hit_from(remote.x, remote.y, shot_angle, config["range"])
             if target is None:
                 continue
             target.health -= config["damage"]
             if target.health <= 0 and target.alive:
                 self.kill_bot(target)
 
-        if not config["infinite"] and remote.ammo[weapon] <= 0:
+        if not config["infinite"] and remote.clip[weapon] <= 0 and remote.ammo[weapon] <= 0:
             remote.current_weapon = "pistol"
 
     def all_humans_dead(self) -> bool:
-        if self.player_health > 0:
+        if self.player_health > 0 or self.player_downed:
             return False
         for remote in self.remote_players.values():
-            if remote.health > 0:
+            if remote.health > 0 or remote.downed:
                 return False
         return True
 
@@ -799,6 +1078,22 @@ class FPSBotArena:
                 else:
                     self.buy_or_equip(weapon)
 
+        if key == "r" and self.game_state == "playing":
+            if self.net_mode != "client":
+                self.start_reload(time.perf_counter())
+
+        if key == "q" and self.game_state == "playing":
+            self.place_team_ping()
+
+        if key == "f1":
+            self.apply_perk_choice("vitality")
+        if key == "f2":
+            self.apply_perk_choice("mobility")
+        if key == "f3":
+            self.apply_perk_choice("regen")
+        if key == "f4":
+            self.apply_perk_choice("weapon")
+
         if key == "r" and self.game_state in {"dead", "bsod"}:
             if self.net_mode == "client":
                 return
@@ -834,6 +1129,7 @@ class FPSBotArena:
 
     def on_close(self) -> None:
         self.save_user_settings()
+        self.save_profile()
         self.release_cursor_clip()
         if self.coop_server is not None:
             self.coop_server.stop()
@@ -945,6 +1241,12 @@ class FPSBotArena:
             self.handle_pause_click(event.x, event.y)
             return
 
+        button = getattr(event, "num", 1)
+        if button in {2, 3}:
+            if self.game_state == "playing":
+                self.place_team_ping()
+            return
+
         self.mouse_down = True
         if self.shop_open and self.game_state == "playing":
             slot = self.shop_slot_from_mouse()
@@ -981,6 +1283,12 @@ class FPSBotArena:
         elif action == "smoothing":
             self.mouse_smoothing_enabled = not self.mouse_smoothing_enabled
             self.smoothed_mouse_dx = 0.0
+            should_save = True
+        elif action == "shared_money":
+            self.shared_money = not self.shared_money
+            should_save = True
+        elif action == "adaptive_quality":
+            self.adaptive_quality_enabled = not self.adaptive_quality_enabled
             should_save = True
         elif action == "fov_down":
             self.fov_degrees = max(MIN_FOV_DEG, self.fov_degrees - FOV_STEP_DEG)
@@ -1020,6 +1328,48 @@ class FPSBotArena:
         if should_save:
             self.save_user_settings()
 
+    def place_team_ping(self) -> None:
+        if self.net_mode == "host":
+            owner = self.player_name
+        else:
+            owner = "YOU"
+        distance_out = 4.2
+        px = self.player_x + math.cos(self.player_angle) * distance_out
+        py = self.player_y + math.sin(self.player_angle) * distance_out
+        if self.is_wall(px, py):
+            px = self.player_x + math.cos(self.player_angle) * 2.2
+            py = self.player_y + math.sin(self.player_angle) * 2.2
+        self.team_ping = (px, py, 5.5, owner)
+
+    def start_reload(self, now: float) -> None:
+        weapon = self.current_weapon
+        config = WEAPON_DATA[weapon]
+        if config["infinite"]:
+            return
+        if self.current_reload_weapon is not None:
+            return
+        mag_size = int(config["mag_size"])
+        if self.clip[weapon] >= mag_size:
+            return
+        if self.ammo[weapon] <= 0:
+            return
+        self.current_reload_weapon = weapon
+        self.reload_end_at = now + float(config["reload_time"])
+
+    def update_reload(self, now: float) -> None:
+        if self.current_reload_weapon is None:
+            return
+        if now < self.reload_end_at:
+            return
+        weapon = self.current_reload_weapon
+        config = WEAPON_DATA[weapon]
+        mag_size = int(config["mag_size"])
+        needed = max(0, mag_size - self.clip[weapon])
+        loaded = min(needed, self.ammo[weapon])
+        self.clip[weapon] += loaded
+        self.ammo[weapon] -= loaded
+        self.current_reload_weapon = None
+
     def buy_or_equip(self, weapon: str) -> None:
         if self.game_state != "playing":
             return
@@ -1027,6 +1377,7 @@ class FPSBotArena:
         config = WEAPON_DATA[weapon]
         if self.owned_weapons[weapon]:
             self.current_weapon = weapon
+            self.current_reload_weapon = None
             return
 
         if self.player_money < config["cost"]:
@@ -1036,11 +1387,14 @@ class FPSBotArena:
         self.owned_weapons[weapon] = True
         self.ammo[weapon] += config["ammo_pack"]
         self.current_weapon = weapon
+        if not config["infinite"] and self.clip[weapon] <= 0:
+            self.start_reload(time.perf_counter())
 
     def loop(self) -> None:
         now = time.perf_counter()
         dt = min(now - self.last_time, 0.05)
         self.last_time = now
+        self.adjust_render_quality(dt, now)
 
         self.update(dt, now)
         self.render(now)
@@ -1048,10 +1402,34 @@ class FPSBotArena:
         ms = int(1000 / max(MIN_FPS_CAP, self.fps_limit))
         self.root.after(ms, self.loop)
 
+    def adjust_render_quality(self, dt: float, now: float) -> None:
+        global RAY_COUNT
+        self.frame_dt_avg = self.frame_dt_avg * 0.9 + dt * 0.1
+        if not self.adaptive_quality_enabled:
+            return
+        if now - self.last_quality_adjust < 0.55:
+            return
+
+        target_dt = 1.0 / max(MIN_FPS_CAP, min(120, self.fps_limit))
+        if self.frame_dt_avg > target_dt * 1.2 and RAY_COUNT > 160:
+            RAY_COUNT = max(160, RAY_COUNT - 10)
+            self.last_quality_adjust = now
+        elif self.frame_dt_avg < target_dt * 0.82 and RAY_COUNT < self.base_ray_target:
+            RAY_COUNT = min(self.base_ray_target, RAY_COUNT + 8)
+            self.last_quality_adjust = now
+
     def update(self, dt: float, now: float) -> None:
+        if self.team_ping is not None:
+            self.team_ping = (self.team_ping[0], self.team_ping[1], self.team_ping[2] - dt, self.team_ping[3])
+            if self.team_ping[2] <= 0:
+                self.team_ping = None
+        self.spread_heat = max(0.0, self.spread_heat - dt * 1.5)
+        self.damage_direction_timer = max(0.0, self.damage_direction_timer - dt)
+
         if self.pause_open:
             if self.net_mode == "client":
                 self.process_client_network_events()
+                self.update_remote_interpolation(dt)
             elif self.net_mode == "host":
                 self.process_host_network_events()
                 self.broadcast_snapshot(now)
@@ -1062,6 +1440,7 @@ class FPSBotArena:
 
         if self.net_mode == "client":
             self.process_client_network_events()
+            self.update_remote_interpolation(dt)
             self.send_client_input(now)
             if self.game_state in {"dead", "bsod"}:
                 self.set_mouse_capture(False)
@@ -1075,8 +1454,10 @@ class FPSBotArena:
             self.process_host_network_events()
 
         if self.game_state == "playing":
+            self.update_reload(now)
+            self.update_downed_state(dt)
             self.time_since_damage += dt
-            if self.player_health > 0:
+            if self.player_health > 0 and not self.player_downed:
                 self.update_player_movement(dt)
                 self.handle_shooting(now)
             if self.net_mode == "host":
@@ -1084,17 +1465,25 @@ class FPSBotArena:
 
             self.update_bots(dt)
             self.update_drops(dt)
+            self.update_objective(dt)
 
-            if self.player_health <= 0:
+            if self.player_health <= 0 and not self.player_downed:
                 self.player_health = 0
-            elif self.player_health < 100.0 and self.time_since_damage >= HEALTH_REGEN_DELAY:
-                self.player_health = min(100.0, self.player_health + HEALTH_REGEN_RATE * dt)
+            elif self.player_health < self.get_max_health_cap() and self.time_since_damage >= HEALTH_REGEN_DELAY:
+                regen = HEALTH_REGEN_RATE * self.get_regen_multiplier()
+                self.player_health = min(self.get_max_health_cap(), self.player_health + regen * dt)
 
             if self.all_humans_dead():
                 self.game_state = "dead"
                 self.set_mouse_capture(False)
 
-            if self.alive_bots() == 0:
+            objective_complete = False
+            if self.objective_type == "defend_zone":
+                objective_complete = self.objective_timer <= 0
+            else:
+                objective_complete = self.alive_bots() == 0
+
+            if objective_complete:
                 if self.wave_timer <= 0:
                     self.wave_timer = 3.2
                 self.wave_timer -= dt
@@ -1117,10 +1506,143 @@ class FPSBotArena:
         if self.net_mode == "host":
             self.broadcast_snapshot(now)
 
+    def update_downed_state(self, dt: float) -> None:
+        if self.player_downed:
+            self.player_bleed_out -= dt
+            if self.player_bleed_out <= 0:
+                self.player_downed = False
+                self.player_health = 0.0
+        else:
+            self.player_revive_progress = max(0.0, self.player_revive_progress - dt * 1.4)
+
+        if self.net_mode != "host":
+            return
+
+        # Local player revives nearby downed teammate.
+        if "e" in self.keys and self.player_health > 0 and not self.player_downed:
+            best_remote: RemotePlayer | None = None
+            best_dist = 999.0
+            for remote in self.remote_players.values():
+                if not remote.downed:
+                    continue
+                d = distance(self.player_x, self.player_y, remote.x, remote.y)
+                if d < 1.7 and d < best_dist:
+                    best_remote = remote
+                    best_dist = d
+            if best_remote is not None:
+                best_remote.revive_progress += dt
+                if best_remote.revive_progress >= 2.3:
+                    best_remote.downed = False
+                    best_remote.bleed_out = 0.0
+                    best_remote.revive_progress = 0.0
+                    best_remote.health = 40.0
+            for remote in self.remote_players.values():
+                if remote is not best_remote:
+                    remote.revive_progress = max(0.0, remote.revive_progress - dt * 1.6)
+        else:
+            for remote in self.remote_players.values():
+                remote.revive_progress = max(0.0, remote.revive_progress - dt * 1.6)
+
+        for remote in self.remote_players.values():
+            if remote.downed:
+                remote.bleed_out -= dt
+                if remote.bleed_out <= 0:
+                    remote.downed = False
+                    remote.health = 0.0
+            elif remote.health > 0:
+                remote.revive_progress = max(0.0, remote.revive_progress - dt * 1.4)
+
+    def update_objective(self, dt: float) -> None:
+        if self.objective_type == "defend_zone" and self.objective_zone is not None:
+            zx, zy, radius = self.objective_zone
+            in_zone = False
+            if self.player_health > 0 and not self.player_downed and distance(self.player_x, self.player_y, zx, zy) <= radius:
+                in_zone = True
+            if self.net_mode == "host":
+                for remote in self.remote_players.values():
+                    if remote.health > 0 and not remote.downed and distance(remote.x, remote.y, zx, zy) <= radius:
+                        in_zone = True
+                        break
+            if in_zone:
+                self.objective_timer = max(0.0, self.objective_timer - dt)
+
+            if self.objective_timer <= 0 and self.wave_cleared_award_pending:
+                self.wave_cleared_award_pending = False
+                reward = 90 + self.wave * 8
+                self.award_money("host", reward)
+                self.gain_xp(45 + self.wave * 4)
+                self.bots.clear()
+                self.wave_timer = 3.2
+        else:
+            if self.alive_bots() == 0 and self.wave_cleared_award_pending:
+                self.wave_cleared_award_pending = False
+                self.gain_xp(30 + self.wave * 3)
+
+    def apply_damage_to_host(self, dmg: float, source_x: float, source_y: float) -> None:
+        if self.player_health <= 0 and not self.player_downed:
+            return
+        self.last_damage_from = math.atan2(source_y - self.player_y, source_x - self.player_x)
+        self.damage_direction_timer = 0.9
+
+        if self.player_downed:
+            self.player_bleed_out -= dmg * 0.08
+            self.time_since_damage = 0.0
+            self.damage_flash = 0.45
+            return
+
+        self.player_health -= dmg
+        self.time_since_damage = 0.0
+        self.damage_flash = 0.45
+        if self.player_health <= 0:
+            self.player_downed = True
+            self.player_bleed_out = 14.0
+            self.player_health = 1.0
+
+    def apply_damage_to_remote(self, remote: RemotePlayer, dmg: float, source_x: float, source_y: float) -> None:
+        _ = source_x
+        _ = source_y
+        if remote.health <= 0 and not remote.downed:
+            return
+        if remote.downed:
+            remote.bleed_out -= dmg * 0.08
+            remote.time_since_damage = 0.0
+            return
+
+        remote.health -= dmg
+        remote.time_since_damage = 0.0
+        if remote.health <= 0:
+            remote.downed = True
+            remote.bleed_out = 14.0
+            remote.health = 1.0
+
+    def award_money(self, collector_id: str, amount: int) -> None:
+        if amount <= 0:
+            return
+        if not self.shared_money:
+            if collector_id == "host":
+                self.player_money += amount
+            else:
+                remote = self.remote_players.get(collector_id)
+                if remote is not None:
+                    remote.money += amount
+            return
+
+        players: list[str] = ["host"] + list(self.remote_players.keys())
+        share = max(1, amount // max(1, len(players)))
+        remainder = amount - share * len(players)
+        for i, pid in enumerate(players):
+            add = share + (1 if i < remainder else 0)
+            if pid == "host":
+                self.player_money += add
+            else:
+                remote = self.remote_players.get(pid)
+                if remote is not None:
+                    remote.money += add
+
     def update_player_movement(self, dt: float) -> None:
-        speed = 3.2
+        speed = 3.2 * self.get_move_speed_multiplier()
         if "shift_l" in self.keys or "shift_r" in self.keys:
-            speed = 4.2
+            speed = 4.2 * self.get_move_speed_multiplier()
 
         move_x = 0.0
         move_y = 0.0
@@ -1159,11 +1681,11 @@ class FPSBotArena:
 
     def choose_bot_target(self, bot: Bot) -> tuple[str, float, float] | None:
         candidates: list[tuple[str, float, float]] = []
-        if self.player_health > 0:
+        if self.player_health > 0 and not self.player_downed:
             candidates.append(("host", self.player_x, self.player_y))
         if self.net_mode == "host":
             for remote in self.remote_players.values():
-                if remote.health > 0:
+                if remote.health > 0 and not remote.downed:
                     candidates.append((remote.player_id, remote.x, remote.y))
 
         if not candidates:
@@ -1193,27 +1715,37 @@ class FPSBotArena:
 
             self.move_bot_toward_target(bot, dt)
 
-            if has_los and dist_to_player < 11.5 and bot.fire_cooldown <= 0:
+            if has_los and dist_to_player < bot.attack_range and bot.fire_cooldown <= 0:
                 base_hit = 0.78 - dist_to_player * 0.055
                 if bot.state == "cover":
                     base_hit += 0.08
+                base_hit += bot.hit_bonus
                 hit_chance = clamp(base_hit, 0.2, 0.84)
 
                 if random.random() < hit_chance:
-                    dmg = random.randint(4, 9) + self.wave // 3
+                    dmg = random.randint(bot.damage_min, bot.damage_max) + self.wave // 3
                     if target_id == "host":
-                        self.player_health -= dmg
-                        self.time_since_damage = 0.0
-                        self.damage_flash = 0.45
+                        self.apply_damage_to_host(dmg, bot.x, bot.y)
                     else:
                         remote = self.remote_players.get(target_id)
                         if remote is not None:
-                            remote.health -= dmg
-                            remote.time_since_damage = 0.0
+                            self.apply_damage_to_remote(remote, dmg, bot.x, bot.y)
 
                 bot.fire_cooldown = random.uniform(0.45, 1.05)
 
     def assign_bot_tactic(self, bot: Bot, target_x: float, target_y: float, has_los: bool, dist_to_player: float) -> None:
+        if bot.kind == "flanker":
+            flank = self.pick_flank_for_bot(bot, target_x, target_y)
+            bot.target_x, bot.target_y = flank
+            bot.state = "flank"
+            return
+        if bot.kind == "sharpshooter" and has_los and dist_to_player > 5.0:
+            cover = self.pick_cover_for_bot(bot, target_x, target_y)
+            if cover:
+                bot.target_x, bot.target_y = cover
+                bot.state = "cover"
+                return
+
         if has_los and dist_to_player < 8.8:
             if random.random() < 0.58:
                 cover = self.pick_cover_for_bot(bot, target_x, target_y)
@@ -1335,13 +1867,13 @@ class FPSBotArena:
             collector_dist = 999.0
 
             d_local = distance(drop.x, drop.y, self.player_x, self.player_y)
-            if self.player_health > 0 and d_local < 0.56:
+            if self.player_health > 0 and not self.player_downed and d_local < 0.56:
                 collector = "host"
                 collector_dist = d_local
 
             if self.net_mode == "host":
                 for remote in self.remote_players.values():
-                    if remote.health <= 0:
+                    if remote.health <= 0 or remote.downed:
                         continue
                     d_remote = distance(drop.x, drop.y, remote.x, remote.y)
                     if d_remote < 0.56 and d_remote < collector_dist:
@@ -1349,11 +1881,9 @@ class FPSBotArena:
                         collector_dist = d_remote
 
             if collector == "host":
-                self.player_money += drop.value
+                self.award_money("host", drop.value)
             elif isinstance(collector, str):
-                remote = self.remote_players.get(collector)
-                if remote is not None:
-                    remote.money += drop.value
+                self.award_money(collector, drop.value)
             else:
                 kept.append(drop)
 
@@ -1364,9 +1894,13 @@ class FPSBotArena:
             return
         if self.pause_open:
             return
+        if self.player_downed:
+            return
         if self.player_health <= 0:
             return
         if self.shop_open:
+            return
+        if self.current_reload_weapon is not None:
             return
         if not self.mouse_down:
             return
@@ -1376,7 +1910,14 @@ class FPSBotArena:
         weapon = self.current_weapon
         config = WEAPON_DATA[weapon]
 
-        if not config["infinite"] and self.ammo[weapon] <= 0:
+        if not config["infinite"] and self.clip[weapon] <= 0:
+            self.start_reload(now)
+            if self.clip[weapon] <= 0:
+                if self.ammo[weapon] <= 0 and weapon != "pistol":
+                    self.current_weapon = "pistol"
+                return
+
+        if not config["infinite"] and self.ammo[weapon] <= 0 and self.clip[weapon] <= 0:
             if weapon != "pistol":
                 self.current_weapon = "pistol"
             return
@@ -1391,32 +1932,54 @@ class FPSBotArena:
         self.muzzle_flash_timer = max(self.muzzle_flash_timer, 0.12 * flash_scale)
 
         if not config["infinite"]:
-            self.ammo[weapon] = max(0, self.ammo[weapon] - 1)
+            self.clip[weapon] = max(0, self.clip[weapon] - 1)
 
         if weapon == "rpg":
             self.game_state = "glitch"
             self.glitch_timer = 1.2
             return
 
+        spread_mul = self.get_spread_multiplier()
+        recoil_mul = self.get_recoil_multiplier()
+        self.spread_heat = min(1.0, self.spread_heat + float(config.get("spread_growth", 0.08)))
+
         pellets = config["pellets"]
         for _ in range(pellets):
-            shot_angle = self.player_angle + random.uniform(-config["spread"], config["spread"])
-            target = self.get_first_bot_hit(shot_angle, config["range"])
+            recoil_pattern = RECOIL_PATTERNS.get(weapon, [0.0])
+            recoil_offset = recoil_pattern[self.recoil_index[weapon] % len(recoil_pattern)]
+            self.recoil_index[weapon] += 1
+            shot_spread = config["spread"] * spread_mul * (1.0 + self.spread_heat * 0.8)
+            recoil_offset *= float(config.get("recoil_scale", 1.0)) * recoil_mul
+            shot_angle = self.player_angle + recoil_offset + random.uniform(-shot_spread, shot_spread)
+            target, headshot = self.get_first_bot_hit(shot_angle, config["range"])
             if target is None:
                 continue
 
-            target.health -= config["damage"]
+            dmg = config["damage"] * self.get_weapon_damage_multiplier()
+            if headshot:
+                dmg *= 1.7
+            target.health -= dmg
             if target.health <= 0 and target.alive:
                 self.kill_bot(target)
 
-        if not config["infinite"] and self.ammo[weapon] <= 0 and weapon != "pistol":
-            self.current_weapon = "pistol"
+        if not config["infinite"]:
+            if self.clip[weapon] <= 0:
+                self.start_reload(now)
+            if self.clip[weapon] <= 0 and self.ammo[weapon] <= 0 and weapon != "pistol":
+                self.current_weapon = "pistol"
 
-    def get_first_bot_hit_from(self, origin_x: float, origin_y: float, shot_angle: float, max_range: float) -> Bot | None:
+    def get_first_bot_hit_from(
+        self,
+        origin_x: float,
+        origin_y: float,
+        shot_angle: float,
+        max_range: float,
+    ) -> tuple[Bot | None, bool]:
         cos_a = math.cos(shot_angle)
         sin_a = math.sin(shot_angle)
 
-        closest = None
+        closest: Bot | None = None
+        headshot = False
         closest_dist = max_range + 1.0
 
         for bot in self.bots:
@@ -1435,18 +1998,20 @@ class FPSBotArena:
 
             if along < closest_dist and self.line_of_sight(origin_x, origin_y, bot.x, bot.y):
                 closest = bot
+                headshot = perp <= bot.radius * 0.4
                 closest_dist = along
 
-        return closest
+        return closest, headshot
 
-    def get_first_bot_hit(self, shot_angle: float, max_range: float) -> Bot | None:
+    def get_first_bot_hit(self, shot_angle: float, max_range: float) -> tuple[Bot | None, bool]:
         return self.get_first_bot_hit_from(self.player_x, self.player_y, shot_angle, max_range)
 
     def kill_bot(self, bot: Bot) -> None:
         bot.alive = False
+        self.gain_xp(int(10 + self.wave * 0.8 + bot.money_multiplier * 4))
         money_count = 1 if random.random() < 0.75 else 2
         for _ in range(money_count):
-            value = random.randint(28, 62) + self.wave * 4
+            value = int((random.randint(28, 62) + self.wave * 4) * bot.money_multiplier)
             ox = random.uniform(-0.16, 0.16)
             oy = random.uniform(-0.16, 0.16)
             self.money_drops.append(MoneyDrop(bot.x + ox, bot.y + oy, value))
@@ -1454,28 +2019,81 @@ class FPSBotArena:
     def spawn_wave(self) -> None:
         self.wave += 1
         spawn_count = min(4 + self.wave * 2, 24)
+        self.wave_cleared_award_pending = True
 
-        if self.player_health <= 0:
-            self.player_health = 65.0
+        if self.player_health <= 0 and not self.player_downed:
+            self.player_health = 65.0 + self.perks["vitality"] * 3
             self.player_x, self.player_y = self.pick_spawn_far_from_point(self.player_x, self.player_y, 4.0)
         else:
-            self.player_health = min(100.0, self.player_health + 12.0)
+            self.player_health = min(self.get_max_health_cap(), self.player_health + 12.0)
+        self.player_downed = False
+        self.player_bleed_out = 0.0
+        self.player_revive_progress = 0.0
 
         if self.net_mode == "host":
             for remote in self.remote_players.values():
-                if remote.health <= 0:
+                if remote.health <= 0 and not remote.downed:
                     remote.health = 65.0
                     remote.x, remote.y = self.pick_spawn_far_from_point(self.player_x, self.player_y, 4.0)
                 else:
                     remote.health = min(100.0, remote.health + 12.0)
+                remote.downed = False
+                remote.bleed_out = 0.0
+                remote.revive_progress = 0.0
 
         reachable_cells = self.get_reachable_floor_cells()
 
+        if self.wave % 4 == 0:
+            self.objective_type = "defend_zone"
+            self.objective_timer = min(22.0, 11.0 + self.wave * 0.55)
+            zx, zy = self.pick_spawn_far_from_player(reachable_cells)
+            self.objective_zone = (zx, zy, 2.4)
+        else:
+            self.objective_type = "eliminate"
+            self.objective_timer = 0.0
+            self.objective_zone = None
+
+        if self.wave > 1:
+            self.gain_xp(14 + self.wave * 2)
+
         for _ in range(spawn_count):
             x, y = self.pick_spawn_far_from_player(reachable_cells)
-            bot_hp = 65 + self.wave * 7
-            bot_speed = 1.2 + min(0.6, self.wave * 0.04)
-            self.bots.append(Bot(x=x, y=y, health=bot_hp, speed=bot_speed, target_x=x, target_y=y))
+            self.bots.append(self.make_wave_bot(x, y))
+
+        if self.wave % 5 == 0:
+            x, y = self.pick_spawn_far_from_player(reachable_cells)
+            self.bots.append(self.make_wave_bot(x, y, forced_kind="boss"))
+
+    def make_wave_bot(self, x: float, y: float, forced_kind: str | None = None) -> Bot:
+        kind = forced_kind
+        if kind is None:
+            roll = random.random()
+            if roll < 0.56:
+                kind = "grunt"
+            elif roll < 0.76:
+                kind = "flanker"
+            elif roll < 0.92:
+                kind = "sharpshooter"
+            else:
+                kind = "tank"
+
+        arch = BOT_ARCHETYPES[kind]
+        bot_hp = (65 + self.wave * 7) * float(arch["hp_mult"])
+        bot_speed = (1.2 + min(0.6, self.wave * 0.04)) * float(arch["speed_mult"])
+        return Bot(
+            x=x,
+            y=y,
+            health=bot_hp,
+            speed=bot_speed,
+            kind=kind,
+            target_x=x,
+            target_y=y,
+            attack_range=float(arch["attack_range"]),
+            hit_bonus=float(arch["hit_bonus"]),
+            damage_min=max(1, 4 + int(arch["damage_min_bonus"])),
+            damage_max=max(2, 9 + int(arch["damage_max_bonus"])),
+            money_multiplier=float(arch["money_mult"]),
+        )
 
     def pick_spawn_far_from_player(self, spawn_cells: list[tuple[int, int]]) -> tuple[float, float]:
         candidates: list[tuple[float, float, float]] = []
@@ -1702,6 +2320,14 @@ class FPSBotArena:
             d = distance(drop.x, drop.y, self.player_x, self.player_y)
             items.append((d, "money", drop))
 
+        if self.team_ping is not None:
+            d = distance(self.team_ping[0], self.team_ping[1], self.player_x, self.player_y)
+            items.append((d, "ping", {"x": self.team_ping[0], "y": self.team_ping[1], "owner": self.team_ping[3]}))
+
+        if self.objective_type == "defend_zone" and self.objective_zone is not None:
+            d = distance(self.objective_zone[0], self.objective_zone[1], self.player_x, self.player_y)
+            items.append((d, "objective", {"x": self.objective_zone[0], "y": self.objective_zone[1]}))
+
         teammates: list[TeammateView] = []
         if self.net_mode == "host":
             for remote in self.remote_players.values():
@@ -1714,6 +2340,7 @@ class FPSBotArena:
                         angle=remote.angle,
                         health=remote.health,
                         weapon=remote.current_weapon,
+                        downed=remote.downed,
                     )
                 )
         else:
@@ -1728,8 +2355,10 @@ class FPSBotArena:
         items.sort(key=lambda item: item[0], reverse=True)
 
         for dist, kind, obj in items:
-            dx = obj.x - self.player_x
-            dy = obj.y - self.player_y
+            obj_x = obj.x if hasattr(obj, "x") else float(obj["x"])
+            obj_y = obj.y if hasattr(obj, "y") else float(obj["y"])
+            dx = obj_x - self.player_x
+            dy = obj_y - self.player_y
             theta = normalize_angle(math.atan2(dy, dx) - self.player_angle)
 
             if theta > math.pi:
@@ -1748,14 +2377,31 @@ class FPSBotArena:
 
             if kind == "bot":
                 bot = obj
-                h = int((HEIGHT * 0.72) / max(0.15, dist))
+                size_scale = 1.0
+                if bot.kind == "tank":
+                    size_scale = 1.18
+                elif bot.kind == "boss":
+                    size_scale = 1.34
+                elif bot.kind == "flanker":
+                    size_scale = 0.92
+                h = int((HEIGHT * 0.72 * size_scale) / max(0.15, dist))
                 w = int(h * 0.48)
                 x1 = screen_x - w / 2
                 y1 = HALF_HEIGHT - h / 2
                 x2 = screen_x + w / 2
                 y2 = HALF_HEIGHT + h / 2
 
-                body = "#d64a4a" if bot.state != "cover" else "#c28a3e"
+                body = "#d64a4a"
+                if bot.kind == "flanker":
+                    body = "#dc8750"
+                elif bot.kind == "tank":
+                    body = "#7b5ad0"
+                elif bot.kind == "sharpshooter":
+                    body = "#49a2d6"
+                elif bot.kind == "boss":
+                    body = "#f04d9d"
+                if bot.state == "cover":
+                    body = "#c28a3e"
                 self.canvas.create_rectangle(x1, y1, x2, y2, fill=body, outline="")
                 head_h = h * 0.28
                 self.canvas.create_oval(x1 + w * 0.2, y1 - head_h * 0.6, x2 - w * 0.2, y1 + head_h * 0.7, fill="#e4b7a0", outline="")
@@ -1768,7 +2414,7 @@ class FPSBotArena:
                 x2 = screen_x + w / 2
                 y2 = HALF_HEIGHT + h / 2
 
-                downed = teammate.health <= 0
+                downed = teammate.downed or teammate.health <= 0
                 body_color = "#4a8ad6" if not downed else "#5a5a5a"
                 name_color = "#bcd8ff" if not downed else "#c8c8c8"
                 label = teammate.name if not downed else f"{teammate.name} [DOWN]"
@@ -1778,7 +2424,7 @@ class FPSBotArena:
                 head_color = "#f1c7ac" if not downed else "#b3b3b3"
                 self.canvas.create_oval(x1 + w * 0.2, y1 - head_h * 0.6, x2 - w * 0.2, y1 + head_h * 0.7, fill=head_color, outline="")
                 self.canvas.create_text(screen_x, y1 - 14, text=label, fill=name_color, font=("Consolas", 10, "bold"))
-            else:
+            elif kind == "money":
                 h = int((HEIGHT * 0.22) / max(0.2, dist))
                 w = h
                 x1 = screen_x - w / 2
@@ -1786,6 +2432,28 @@ class FPSBotArena:
                 x2 = screen_x + w / 2
                 y2 = y1 + h
                 self.canvas.create_oval(x1, y1, x2, y2, fill="#68d96f", outline="")
+            elif kind == "ping":
+                size = int((HEIGHT * 0.16) / max(0.2, dist))
+                self.canvas.create_oval(
+                    screen_x - size,
+                    HALF_HEIGHT - size,
+                    screen_x + size,
+                    HALF_HEIGHT + size,
+                    outline="#ffd967",
+                    width=3,
+                )
+                self.canvas.create_text(screen_x, HALF_HEIGHT - size - 14, text="PING", fill="#ffea95", font=("Consolas", 10, "bold"))
+            elif kind == "objective":
+                size = int((HEIGHT * 0.2) / max(0.2, dist))
+                self.canvas.create_rectangle(
+                    screen_x - size,
+                    HALF_HEIGHT - size,
+                    screen_x + size,
+                    HALF_HEIGHT + size,
+                    outline="#7ce6ff",
+                    width=3,
+                )
+                self.canvas.create_text(screen_x, HALF_HEIGHT - size - 14, text="ZONE", fill="#b9f1ff", font=("Consolas", 10, "bold"))
 
     def render_viewmodel(self, now: float) -> None:
         if self.game_state not in {"playing", "glitch"}:
@@ -1883,30 +2551,73 @@ class FPSBotArena:
         self.canvas.create_line(WIDTH // 2, HALF_HEIGHT - 10, WIDTH // 2, HALF_HEIGHT + 10, fill="#f4f4f4", width=2)
 
         self.canvas.create_rectangle(24, 24, 300, 56, fill="#000", outline="#343434", width=2)
-        hp_width = int(272 * (self.player_health / 100.0))
+        hp_cap = max(1.0, self.get_max_health_cap())
+        hp_width = int(272 * (self.player_health / hp_cap))
         hp_color = "#52cc52" if self.player_health > 35 else "#cc4a3f"
         self.canvas.create_rectangle(26, 26, 26 + hp_width, 54, fill=hp_color, outline="")
         self.canvas.create_text(162, 40, text=f"Health: {int(self.player_health)}", fill="#fff", font=("Consolas", 14, "bold"))
+        if self.player_downed:
+            self.canvas.create_text(162, 60, text=f"DOWNED {self.player_bleed_out:.1f}s", fill="#ff9f9f", font=("Consolas", 10, "bold"))
 
-        ammo_text = "INF" if WEAPON_DATA[self.current_weapon]["infinite"] else str(self.ammo[self.current_weapon])
+        if WEAPON_DATA[self.current_weapon]["infinite"]:
+            ammo_text = "INF"
+        else:
+            ammo_text = f"{self.clip[self.current_weapon]}/{self.ammo[self.current_weapon]}"
         weapon_name = WEAPON_DATA[self.current_weapon]["name"]
         self.canvas.create_text(26, 80, anchor="nw", text=f"Weapon: {weapon_name}", fill="#f3f3f3", font=("Consolas", 18, "bold"))
         self.canvas.create_text(26, 108, anchor="nw", text=f"Ammo: {ammo_text}", fill="#f3f3f3", font=("Consolas", 16))
 
+        if self.current_reload_weapon is not None:
+            self.canvas.create_text(26, 128, anchor="nw", text="RELOADING...", fill="#ffcf7a", font=("Consolas", 12, "bold"))
+        elif not WEAPON_DATA[self.current_weapon]["infinite"]:
+            low = self.clip[self.current_weapon] <= max(2, int(WEAPON_DATA[self.current_weapon]["mag_size"] * 0.2))
+            if low:
+                self.canvas.create_text(26, 128, anchor="nw", text="LOW AMMO", fill="#ff6b6b", font=("Consolas", 12, "bold"))
+
         self.canvas.create_text(26, 138, anchor="nw", text=f"Money: ${self.player_money}", fill="#78e088", font=("Consolas", 18, "bold"))
         self.canvas.create_text(26, 166, anchor="nw", text=f"Wave: {self.wave}", fill="#dfdfdf", font=("Consolas", 16))
         self.canvas.create_text(26, 192, anchor="nw", text=f"Bots Alive: {self.alive_bots()}", fill="#dfdfdf", font=("Consolas", 16))
+        self.canvas.create_text(
+            26,
+            218,
+            anchor="nw",
+            text=f"Level {self.profile_level}  XP {self.profile_xp}/{self.xp_to_next_level()}  Perks {self.perk_points}",
+            fill="#c8e0ff",
+            font=("Consolas", 12, "bold"),
+        )
 
         teammate_count = len(self.remote_players) if self.net_mode == "host" else len(self.remote_render_players)
         if self.net_mode != "single":
-            self.canvas.create_text(26, 218, anchor="nw", text=f"Teammates: {teammate_count}", fill="#9cc9ff", font=("Consolas", 16))
-            self.canvas.create_text(26, 244, anchor="nw", text=self.net_status, fill="#9cc9ff", font=("Consolas", 12))
+            self.canvas.create_text(26, 242, anchor="nw", text=f"Teammates: {teammate_count}", fill="#9cc9ff", font=("Consolas", 16))
+            self.canvas.create_text(26, 268, anchor="nw", text=self.net_status, fill="#9cc9ff", font=("Consolas", 12))
 
-        help_text = "WASD + Mouse | B Shop | Esc Pause/Settings | 1-4 Buy/Switch | R Restart"
+        objective_text = "Objective: Eliminate all bots"
+        if self.objective_type == "defend_zone":
+            objective_text = f"Objective: Hold zone {self.objective_timer:.1f}s"
+        self.canvas.create_text(
+            26,
+            HEIGHT - 108,
+            anchor="nw",
+            text=objective_text,
+            fill="#bfe9ff",
+            font=("Consolas", 12, "bold"),
+        )
+        if self.wave_timer > 0:
+            self.canvas.create_text(
+                26,
+                HEIGHT - 128,
+                anchor="nw",
+                text=f"Next wave in {self.wave_timer:.1f}s",
+                fill="#ffe8a1",
+                font=("Consolas", 12, "bold"),
+            )
+
+        help_text = "WASD + Mouse | B Shop | Q Ping | R Reload | F1-4 Spend Perks"
         if self.net_mode == "client":
-            help_text = "CO-OP Client | WASD+Mouse -> host | Esc Pause/Settings | B Shop"
+            help_text = "CO-OP Client | WASD+Mouse -> host | Q Ping | R Reload | Esc Settings"
         elif self.net_mode == "host":
-            help_text = "CO-OP Host | Esc Pause/Settings | Others can join via your IP + port"
+            money_mode = "Shared $" if self.shared_money else "Split $"
+            help_text = f"CO-OP Host | {money_mode} | Esc Settings | Others can join via your IP + port"
 
         self.canvas.create_text(
             WIDTH - 22,
@@ -1916,6 +2627,26 @@ class FPSBotArena:
             fill="#e0e0e0",
             font=("Consolas", 12),
         )
+
+        self.canvas.create_text(
+            WIDTH - 22,
+            44,
+            anchor="ne",
+            text=f"Quality: {RAY_COUNT} rays ({'Auto' if self.adaptive_quality_enabled else 'Manual'})",
+            fill="#cfd5de",
+            font=("Consolas", 11),
+        )
+
+        if self.damage_direction_timer > 0.01:
+            rel = normalize_angle(self.last_damage_from - self.player_angle)
+            if rel > math.pi:
+                rel -= math.tau
+            arrow_radius = 42
+            ax = WIDTH // 2 + math.cos(rel) * arrow_radius
+            ay = HALF_HEIGHT + math.sin(rel) * arrow_radius
+            bx = WIDTH // 2 + math.cos(rel) * (arrow_radius + 16)
+            by = HALF_HEIGHT + math.sin(rel) * (arrow_radius + 16)
+            self.canvas.create_line(ax, ay, bx, by, fill="#ff8a8a", width=3, arrow=tk.LAST)
 
         self.draw_weapon_bar()
 
@@ -1984,6 +2715,32 @@ class FPSBotArena:
         )
         row_y += row_gap
 
+        self.draw_pause_adjust_row(
+            x1,
+            x2,
+            row_y,
+            "Shared Team Money",
+            "On" if self.shared_money else "Off",
+            "shared_money",
+            "shared_money",
+            left_label="Toggle",
+            right_label="Toggle",
+        )
+        row_y += row_gap
+
+        self.draw_pause_adjust_row(
+            x1,
+            x2,
+            row_y,
+            "Adaptive Quality",
+            "On" if self.adaptive_quality_enabled else "Off",
+            "adaptive_quality",
+            "adaptive_quality",
+            left_label="Toggle",
+            right_label="Toggle",
+        )
+        row_y += row_gap
+
         fullscreen_text = "On" if self.fullscreen_enabled else "Off"
         self.draw_pause_adjust_row(
             x1,
@@ -2028,6 +2785,16 @@ class FPSBotArena:
             str(self.fps_limit),
             "fps_down",
             "fps_up",
+        )
+
+        self.canvas.create_text(
+            x1 + 30,
+            y2 - 146,
+            anchor="nw",
+            text=f"Perks: F1 Vitality {self.perks['vitality']} | F2 Mobility {self.perks['mobility']} | "
+            f"F3 Regen {self.perks['regen']} | F4 Weapon {self.perks['weapon']} | Points: {self.perk_points}",
+            fill="#d2e5ff",
+            font=("Consolas", 10),
         )
 
         if self.fullscreen_enabled:
@@ -2117,7 +2884,7 @@ class FPSBotArena:
             if owned:
                 extra = ""
                 if not WEAPON_DATA[weapon]["infinite"]:
-                    extra = f" ({self.ammo[weapon]})"
+                    extra = f" ({self.clip[weapon]}/{self.ammo[weapon]})"
                 label = f"{WEAPON_DATA[weapon]['name']}{extra}"
                 color = "#f4f4f4"
             else:
@@ -2168,7 +2935,7 @@ class FPSBotArena:
                 if weapon == self.current_weapon:
                     txt += "\n[EQUIPPED]"
                 elif not WEAPON_DATA[weapon]["infinite"]:
-                    txt += f"\nAmmo: {self.ammo[weapon]}"
+                    txt += f"\nAmmo: {self.clip[weapon]}/{self.ammo[weapon]}"
             else:
                 txt = f"{WEAPON_DATA[weapon]['name']}\n${WEAPON_DATA[weapon]['cost']}"
 
