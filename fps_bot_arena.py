@@ -649,6 +649,10 @@ class FPSBotArena:
                 self.apply_snapshot(message)
 
     def apply_snapshot(self, payload: dict) -> None:
+        you_id = str(payload.get("you_id", "")).strip()
+        if you_id:
+            self.player_id = you_id
+
         you = payload.get("you", {})
         self.player_x = float(you.get("x", self.player_x))
         self.player_y = float(you.get("y", self.player_y))
@@ -779,6 +783,7 @@ class FPSBotArena:
         for remote in self.remote_players.values():
             payload = {
                 "type": "snapshot",
+                "you_id": remote.player_id,
                 "you": self.serialize_remote(remote),
                 "players": players,
                 "bots": bots,
@@ -1700,9 +1705,9 @@ class FPSBotArena:
             teammates = list(self.remote_render_players)
 
         for teammate in teammates:
-            if teammate.health <= 0:
-                continue
             d = distance(teammate.x, teammate.y, self.player_x, self.player_y)
+            if d < 0.35:
+                continue
             items.append((d, "human", teammate))
 
         items.sort(key=lambda item: item[0], reverse=True)
@@ -1748,10 +1753,16 @@ class FPSBotArena:
                 x2 = screen_x + w / 2
                 y2 = HALF_HEIGHT + h / 2
 
-                self.canvas.create_rectangle(x1, y1, x2, y2, fill="#4a8ad6", outline="")
+                downed = teammate.health <= 0
+                body_color = "#4a8ad6" if not downed else "#5a5a5a"
+                name_color = "#bcd8ff" if not downed else "#c8c8c8"
+                label = teammate.name if not downed else f"{teammate.name} [DOWN]"
+
+                self.canvas.create_rectangle(x1, y1, x2, y2, fill=body_color, outline="")
                 head_h = h * 0.28
-                self.canvas.create_oval(x1 + w * 0.2, y1 - head_h * 0.6, x2 - w * 0.2, y1 + head_h * 0.7, fill="#f1c7ac", outline="")
-                self.canvas.create_text(screen_x, y1 - 14, text=teammate.name, fill="#bcd8ff", font=("Consolas", 10, "bold"))
+                head_color = "#f1c7ac" if not downed else "#b3b3b3"
+                self.canvas.create_oval(x1 + w * 0.2, y1 - head_h * 0.6, x2 - w * 0.2, y1 + head_h * 0.7, fill=head_color, outline="")
+                self.canvas.create_text(screen_x, y1 - 14, text=label, fill=name_color, font=("Consolas", 10, "bold"))
             else:
                 h = int((HEIGHT * 0.22) / max(0.2, dist))
                 w = h
