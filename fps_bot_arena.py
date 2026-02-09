@@ -24,6 +24,7 @@ PLAYER_RADIUS = 0.22
 TARGET_FPS = 60
 HEALTH_REGEN_DELAY = 4.0
 HEALTH_REGEN_RATE = 3.0
+CONNECT_TIMEOUT_SECONDS = 4.0
 
 WORLD_MAP = [
     "########################",
@@ -297,7 +298,11 @@ class CoopHostServer:
 class CoopClient:
     def __init__(self, host: str, port: int, name: str) -> None:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.connect((host, port))
+        self.sock.settimeout(CONNECT_TIMEOUT_SECONDS)
+        try:
+            self.sock.connect((host, port))
+        finally:
+            self.sock.settimeout(None)
         self.sock.setblocking(False)
 
         self.incoming: queue.Queue[dict] = queue.Queue()
@@ -404,7 +409,13 @@ class FPSBotArena:
                 self.net_status = f"Joining {connect_host}:{port}"
             except OSError as exc:
                 self.coop_client = None
-                self.net_status = f"Connection failed: {exc}"
+                code = getattr(exc, "winerror", None)
+                if code is None:
+                    code = getattr(exc, "errno", "unknown")
+                self.net_status = (
+                    f"Connection failed ({code}): {exc}. "
+                    "Check host IP/port and firewall."
+                )
                 self.client_connected = False
 
         title = "FPS Bot Arena"

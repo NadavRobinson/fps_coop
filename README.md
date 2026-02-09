@@ -39,3 +39,11 @@ Notes:
 - Host simulates the shared world, bots, drops, and waves.
 - Teammates render as blue human players, not bots.
 - Open/forward the selected TCP port (`5050` by default) when playing outside LAN.
+
+
+### Troubleshooting join timeout
+
+- Make sure host is running with `--host` before joining.
+- Use host LAN IP (same Wi-Fi): `192.168.x.x` style address.
+- On host Windows firewall, allow inbound TCP on your game port (`5050` by default).
+- From Mac, test reachability: `nc -vz HOST_IP 5050`.
