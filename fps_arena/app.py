@@ -203,6 +203,21 @@ class FPSBotArena:
         self.remote_interp_targets: dict[str, tuple[float, float, float, float, str, bool, str, int, int, int, int]] = {}
         self.remote_render_map: dict[str, TeammateView] = {}
         self.wave_cleared_award_pending = False
+        self.sky_stars = [
+            (
+                random.random(),
+                random.uniform(0.02, 0.96),
+                random.randint(1, 2),
+                random.randint(140, 240),
+            )
+            for _ in range(48)
+        ]
+        self.wall_palette = [
+            (150, 148, 138),
+            (124, 138, 156),
+            (153, 120, 112),
+            (117, 136, 120),
+        ]
 
         self.mouse_locked = True
         self.focused = True
@@ -2253,7 +2268,7 @@ class FPSBotArena:
                 return False
         return True
 
-    def cast_ray(self, angle: float) -> tuple[float, int]:
+    def cast_ray(self, angle: float) -> tuple[float, int, int, int]:
         px = self.player_x
         py = self.player_y
         sin_a = math.sin(angle)
@@ -2295,15 +2310,15 @@ class FPSBotArena:
                 side = 1
 
             if dist > MAX_DEPTH:
-                return MAX_DEPTH, side
+                return MAX_DEPTH, side, map_x, map_y
 
             if map_y < 0 or map_y >= len(WORLD_MAP) or map_x < 0 or map_x >= len(WORLD_MAP[0]):
-                return MAX_DEPTH, side
+                return MAX_DEPTH, side, map_x, map_y
 
             if WORLD_MAP[map_y][map_x] == "#":
-                return dist, side
+                return dist, side, map_x, map_y
 
-        return MAX_DEPTH, side
+        return MAX_DEPTH, side, map_x, map_y
 
     def shop_slot_from_mouse(self) -> int | None:
         cx = WIDTH // 2
@@ -2346,16 +2361,100 @@ class FPSBotArena:
         if self.pause_open:
             self.render_pause_menu()
 
+    def mix_rgb(self, a: tuple[int, int, int], b: tuple[int, int, int], t: float) -> tuple[int, int, int]:
+        t = clamp(t, 0.0, 1.0)
+        r = int(a[0] + (b[0] - a[0]) * t)
+        g = int(a[1] + (b[1] - a[1]) * t)
+        b2 = int(a[2] + (b[2] - a[2]) * t)
+        return (r, g, b2)
+
+    def draw_ui_panel(
+        self,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        fill: str = "#101722",
+        outline: str = "#5f7899",
+    ) -> None:
+        self.canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline=outline, width=2)
+        self.canvas.create_rectangle(x1, y1, x2, y2, fill="#0b1119", outline="", stipple="gray50")
+
+    def sample_wall_color(
+        self,
+        map_x: int,
+        map_y: int,
+        tex_u: float,
+        corrected_dist: float,
+        side: int,
+    ) -> str:
+        tex_u = tex_u % 1.0
+        tile = abs(map_x * 17 + map_y * 23) % len(self.wall_palette)
+        base_r, base_g, base_b = self.wall_palette[tile]
+
+        grain = 0.9 + 0.14 * math.sin(tex_u * math.tau * 6.0 + tile * 0.8)
+        mortar = 0.74 if tex_u < 0.08 or tex_u > 0.92 else 1.0
+        shade = clamp(1.26 - corrected_dist * 0.1, 0.22, 1.0)
+        if side == 1:
+            shade *= 0.78
+
+        fog = clamp((corrected_dist - 4.5) / 13.0, 0.0, 0.62)
+        fog_r, fog_g, fog_b = (34, 38, 48)
+        lit_r = base_r * shade * grain * mortar
+        lit_g = base_g * shade * grain * mortar
+        lit_b = base_b * shade * grain * mortar
+
+        r = int(clamp(lit_r * (1.0 - fog) + fog_r * fog, 18, 245))
+        g = int(clamp(lit_g * (1.0 - fog) + fog_g * fog, 18, 245))
+        b = int(clamp(lit_b * (1.0 - fog) + fog_b * fog, 18, 245))
+        return rgb(r, g, b)
+
     def render_world(self) -> None:
-        self.canvas.create_rectangle(0, 0, WIDTH, HALF_HEIGHT, fill="#2a2e36", outline="")
-        self.canvas.create_rectangle(0, HALF_HEIGHT, WIDTH, HEIGHT, fill="#181614", outline="")
+        ceiling_steps = 14
+        for i in range(ceiling_steps):
+            t = i / max(1, ceiling_steps - 1)
+            top = (13, 18, 30)
+            bottom = (49, 65, 90)
+            r, g, b = self.mix_rgb(top, bottom, t)
+            y1 = int(i * HALF_HEIGHT / ceiling_steps)
+            y2 = int((i + 1) * HALF_HEIGHT / ceiling_steps) + 1
+            self.canvas.create_rectangle(0, y1, WIDTH, y2, fill=rgb(r, g, b), outline="")
+
+        parallax = (self.player_angle / math.tau) * 0.35
+        for sx, sy, size, brightness in self.sky_stars:
+            star_x = int(((sx + parallax) % 1.0) * WIDTH)
+            star_y = int(sy * HALF_HEIGHT * 0.9)
+            color = rgb(brightness, brightness, min(255, brightness + 20))
+            self.canvas.create_rectangle(star_x, star_y, star_x + size, star_y + size, fill=color, outline="")
+
+        floor_steps = 18
+        for i in range(floor_steps):
+            t = i / max(1, floor_steps - 1)
+            top = (31, 27, 24)
+            bottom = (16, 14, 14)
+            r, g, b = self.mix_rgb(top, bottom, t)
+            y1 = HALF_HEIGHT + int(i * (HEIGHT - HALF_HEIGHT) / floor_steps)
+            y2 = HALF_HEIGHT + int((i + 1) * (HEIGHT - HALF_HEIGHT) / floor_steps) + 1
+            self.canvas.create_rectangle(0, y1, WIDTH, y2, fill=rgb(r, g, b), outline="")
+
+        for row in range(1, 10):
+            t = row / 10.0
+            y = HALF_HEIGHT + int((t**1.9) * (HEIGHT - HALF_HEIGHT))
+            line_shade = int(clamp(58 - t * 34, 16, 58))
+            self.canvas.create_line(0, y, WIDTH, y, fill=rgb(line_shade, line_shade - 8, line_shade - 10), width=1)
+
+        lane_spacing = max(52, WIDTH // 16)
+        lane_offset = int((self.player_angle / math.tau) * lane_spacing)
+        for lane_x in range(-lane_spacing + lane_offset, WIDTH + lane_spacing, lane_spacing):
+            end_x = int(WIDTH // 2 + (lane_x - WIDTH // 2) * 0.28)
+            self.canvas.create_line(lane_x, HALF_HEIGHT + 3, end_x, HEIGHT, fill="#25211f", width=1)
 
         slice_width = WIDTH / RAY_COUNT
         self.zbuffer: list[float] = []
 
         for i in range(RAY_COUNT):
             ray_angle = self.player_angle - FOV / 2 + (i / RAY_COUNT) * FOV
-            dist, side = self.cast_ray(ray_angle)
+            dist, side, map_x, map_y = self.cast_ray(ray_angle)
 
             corrected = dist * math.cos(ray_angle - self.player_angle)
             corrected = max(0.0001, corrected)
@@ -2363,13 +2462,10 @@ class FPSBotArena:
 
             proj_height = int((HEIGHT * 0.95) / corrected)
             proj_height = min(HEIGHT, proj_height)
-
-            shade = int(230 - corrected * 20)
-            shade = int(clamp(shade, 24, 230))
-            if side == 1:
-                shade = int(shade * 0.72)
-
-            color = rgb(shade, shade, shade + 5)
+            hit_x = self.player_x + math.cos(ray_angle) * dist
+            hit_y = self.player_y + math.sin(ray_angle) * dist
+            tex_u = (hit_y - math.floor(hit_y)) if side == 0 else (hit_x - math.floor(hit_x))
+            color = self.sample_wall_color(map_x, map_y, tex_u, corrected, side)
             x1 = i * slice_width
             x2 = x1 + slice_width + 1
             y1 = HALF_HEIGHT - proj_height // 2
@@ -2474,9 +2570,18 @@ class FPSBotArena:
                     body = "#f04d9d"
                 if bot.state == "cover":
                     body = "#c28a3e"
-                self.canvas.create_rectangle(x1, y1, x2, y2, fill=body, outline="")
+                self.canvas.create_rectangle(x1, y1, x2, y2, fill=body, outline="#101116", width=2)
                 head_h = h * 0.28
                 self.canvas.create_oval(x1 + w * 0.2, y1 - head_h * 0.6, x2 - w * 0.2, y1 + head_h * 0.7, fill="#e4b7a0", outline="")
+                arch = BOT_ARCHETYPES.get(bot.kind, BOT_ARCHETYPES["grunt"])
+                hp_cap = max(1.0, (65 + self.wave * 7) * float(arch["hp_mult"]))
+                hp_ratio = clamp(bot.health / hp_cap, 0.0, 1.0)
+                bar_w = max(28, int(w * 1.08))
+                bar_x1 = screen_x - bar_w / 2
+                bar_x2 = screen_x + bar_w / 2
+                bar_y1 = y1 - 18
+                self.canvas.create_rectangle(bar_x1, bar_y1, bar_x2, bar_y1 + 7, fill="#191d24", outline="")
+                self.canvas.create_rectangle(bar_x1, bar_y1, bar_x1 + bar_w * hp_ratio, bar_y1 + 7, fill="#e96f62", outline="")
             elif kind == "human":
                 teammate = obj
                 h = int((HEIGHT * 0.7) / max(0.15, dist))
@@ -2491,11 +2596,18 @@ class FPSBotArena:
                 name_color = "#bcd8ff" if not downed else "#c8c8c8"
                 label = teammate.name if not downed else f"{teammate.name} [DOWN]"
 
-                self.canvas.create_rectangle(x1, y1, x2, y2, fill=body_color, outline="")
+                self.canvas.create_rectangle(x1, y1, x2, y2, fill=body_color, outline="#0f1118", width=2)
                 head_h = h * 0.28
                 head_color = "#f1c7ac" if not downed else "#b3b3b3"
                 self.canvas.create_oval(x1 + w * 0.2, y1 - head_h * 0.6, x2 - w * 0.2, y1 + head_h * 0.7, fill=head_color, outline="")
                 self.canvas.create_text(screen_x, y1 - 14, text=label, fill=name_color, font=("Consolas", 10, "bold"))
+                hp_ratio = 0.0 if downed else clamp(teammate.health / 100.0, 0.0, 1.0)
+                bar_w = max(24, int(w * 1.0))
+                bar_x1 = screen_x - bar_w / 2
+                bar_x2 = screen_x + bar_w / 2
+                bar_y1 = y1 - 6
+                self.canvas.create_rectangle(bar_x1, bar_y1, bar_x2, bar_y1 + 6, fill="#1a2029", outline="")
+                self.canvas.create_rectangle(bar_x1, bar_y1, bar_x1 + bar_w * hp_ratio, bar_y1 + 6, fill="#61d08a", outline="")
             elif kind == "money":
                 h = int((HEIGHT * 0.22) / max(0.2, dist))
                 w = h
@@ -2503,7 +2615,8 @@ class FPSBotArena:
                 y1 = HALF_HEIGHT + h * 0.2
                 x2 = screen_x + w / 2
                 y2 = y1 + h
-                self.canvas.create_oval(x1, y1, x2, y2, fill="#68d96f", outline="")
+                self.canvas.create_oval(x1, y1, x2, y2, fill="#68d96f", outline="#19361b", width=2)
+                self.canvas.create_text(screen_x, y1 + h * 0.5, text="$", fill="#e9ffe5", font=("Consolas", 10, "bold"))
             elif kind == "ping":
                 size = int((HEIGHT * 0.16) / max(0.2, dist))
                 self.canvas.create_oval(
@@ -2515,6 +2628,8 @@ class FPSBotArena:
                     width=3,
                 )
                 self.canvas.create_text(screen_x, HALF_HEIGHT - size - 14, text="PING", fill="#ffea95", font=("Consolas", 10, "bold"))
+                owner = str(obj.get("owner", "TEAM")).upper()
+                self.canvas.create_text(screen_x, HALF_HEIGHT + size + 12, text=owner, fill="#ffe7ad", font=("Consolas", 9, "bold"))
             elif kind == "objective":
                 size = int((HEIGHT * 0.2) / max(0.2, dist))
                 self.canvas.create_rectangle(
@@ -2526,6 +2641,7 @@ class FPSBotArena:
                     width=3,
                 )
                 self.canvas.create_text(screen_x, HALF_HEIGHT - size - 14, text="ZONE", fill="#b9f1ff", font=("Consolas", 10, "bold"))
+                self.canvas.create_text(screen_x, HALF_HEIGHT + size + 12, text="DEFEND", fill="#b9f1ff", font=("Consolas", 9, "bold"))
 
     def render_viewmodel(self, now: float) -> None:
         if self.game_state not in {"playing", "glitch"}:
@@ -2619,95 +2735,139 @@ class FPSBotArena:
             self.canvas.create_line(x, y, rx, ry, fill="#fff7d0", width=3)
 
     def render_hud(self) -> None:
-        self.canvas.create_line(WIDTH // 2 - 10, HALF_HEIGHT, WIDTH // 2 + 10, HALF_HEIGHT, fill="#f4f4f4", width=2)
-        self.canvas.create_line(WIDTH // 2, HALF_HEIGHT - 10, WIDTH // 2, HALF_HEIGHT + 10, fill="#f4f4f4", width=2)
+        cx = WIDTH // 2
+        cy = HALF_HEIGHT
+        self.canvas.create_oval(cx - 11, cy - 11, cx + 11, cy + 11, outline="#d8e6f7", width=2)
+        self.canvas.create_line(cx - 16, cy, cx - 6, cy, fill="#f3f8ff", width=2)
+        self.canvas.create_line(cx + 6, cy, cx + 16, cy, fill="#f3f8ff", width=2)
+        self.canvas.create_line(cx, cy - 16, cx, cy - 6, fill="#f3f8ff", width=2)
+        self.canvas.create_line(cx, cy + 6, cx, cy + 16, fill="#f3f8ff", width=2)
+        self.canvas.create_oval(cx - 2, cy - 2, cx + 2, cy + 2, fill="#ffffff", outline="")
 
-        self.canvas.create_rectangle(24, 24, 300, 56, fill="#000", outline="#343434", width=2)
+        left_x1 = 18
+        left_x2 = 364
+        top_y1 = 16
+        top_y2 = 188
+        self.draw_ui_panel(left_x1, top_y1, left_x2, top_y2)
+        self.canvas.create_text(left_x1 + 14, top_y1 + 10, anchor="nw", text="COMBAT STATUS", fill="#d9e9ff", font=("Consolas", 12, "bold"))
+
         hp_cap = max(1.0, self.get_max_health_cap())
-        hp_width = int(272 * (self.player_health / hp_cap))
-        hp_color = "#52cc52" if self.player_health > 35 else "#cc4a3f"
-        self.canvas.create_rectangle(26, 26, 26 + hp_width, 54, fill=hp_color, outline="")
-        self.canvas.create_text(162, 40, text=f"Health: {int(self.player_health)}", fill="#fff", font=("Consolas", 14, "bold"))
-        if self.player_downed:
-            self.canvas.create_text(162, 60, text=f"DOWNED {self.player_bleed_out:.1f}s", fill="#ff9f9f", font=("Consolas", 10, "bold"))
+        hp_ratio = clamp(self.player_health / hp_cap, 0.0, 1.0)
+        hp_bar_x1 = left_x1 + 14
+        hp_bar_x2 = left_x2 - 14
+        hp_bar_y1 = top_y1 + 42
+        self.canvas.create_rectangle(hp_bar_x1, hp_bar_y1, hp_bar_x2, hp_bar_y1 + 22, fill="#1b222d", outline="")
+        hp_fill_color = "#52cc8f" if self.player_health > 35 else "#d76659"
+        self.canvas.create_rectangle(hp_bar_x1, hp_bar_y1, hp_bar_x1 + (hp_bar_x2 - hp_bar_x1) * hp_ratio, hp_bar_y1 + 22, fill=hp_fill_color, outline="")
+        self.canvas.create_text(hp_bar_x1 + 8, hp_bar_y1 + 11, anchor="w", text=f"HP {int(self.player_health)}/{int(hp_cap)}", fill="#ffffff", font=("Consolas", 11, "bold"))
 
-        if WEAPON_DATA[self.current_weapon]["infinite"]:
+        weapon_name = WEAPON_DATA[self.current_weapon]["name"]
+        ammo_cfg = WEAPON_DATA[self.current_weapon]
+        if ammo_cfg["infinite"]:
             ammo_text = "INF"
+            ammo_ratio = 1.0
         else:
             ammo_text = f"{self.clip[self.current_weapon]}/{self.ammo[self.current_weapon]}"
-        weapon_name = WEAPON_DATA[self.current_weapon]["name"]
-        self.canvas.create_text(26, 80, anchor="nw", text=f"Weapon: {weapon_name}", fill="#f3f3f3", font=("Consolas", 18, "bold"))
-        self.canvas.create_text(26, 108, anchor="nw", text=f"Ammo: {ammo_text}", fill="#f3f3f3", font=("Consolas", 16))
+            mag = max(1, int(ammo_cfg["mag_size"]))
+            ammo_ratio = clamp(self.clip[self.current_weapon] / mag, 0.0, 1.0)
 
-        if self.current_reload_weapon is not None:
-            self.canvas.create_text(26, 128, anchor="nw", text="RELOADING...", fill="#ffcf7a", font=("Consolas", 12, "bold"))
-        elif not WEAPON_DATA[self.current_weapon]["infinite"]:
-            low = self.clip[self.current_weapon] <= max(2, int(WEAPON_DATA[self.current_weapon]["mag_size"] * 0.2))
-            if low:
-                self.canvas.create_text(26, 128, anchor="nw", text="LOW AMMO", fill="#ff6b6b", font=("Consolas", 12, "bold"))
-
-        self.canvas.create_text(26, 138, anchor="nw", text=f"Money: ${self.player_money}", fill="#78e088", font=("Consolas", 18, "bold"))
-        self.canvas.create_text(26, 166, anchor="nw", text=f"Wave: {self.wave}", fill="#dfdfdf", font=("Consolas", 16))
-        self.canvas.create_text(26, 192, anchor="nw", text=f"Bots Alive: {self.alive_bots()}", fill="#dfdfdf", font=("Consolas", 16))
-        self.canvas.create_text(
-            26,
-            218,
-            anchor="nw",
-            text=f"Level {self.profile_level}  XP {self.profile_xp}/{self.xp_to_next_level()}  Perks {self.perk_points}",
-            fill="#c8e0ff",
-            font=("Consolas", 12, "bold"),
+        ammo_bar_y1 = hp_bar_y1 + 34
+        self.canvas.create_rectangle(hp_bar_x1, ammo_bar_y1, hp_bar_x2, ammo_bar_y1 + 18, fill="#1b222d", outline="")
+        self.canvas.create_rectangle(
+            hp_bar_x1,
+            ammo_bar_y1,
+            hp_bar_x1 + (hp_bar_x2 - hp_bar_x1) * ammo_ratio,
+            ammo_bar_y1 + 18,
+            fill="#8ac6ff" if ammo_ratio > 0.2 else "#d98753",
+            outline="",
         )
+        self.canvas.create_text(hp_bar_x1 + 8, ammo_bar_y1 + 9, anchor="w", text=f"{weapon_name}  {ammo_text}", fill="#edf5ff", font=("Consolas", 10, "bold"))
+
+        status_line = "READY"
+        status_color = "#7fd89d"
+        if self.player_downed:
+            status_line = f"DOWNED  BLEED OUT {self.player_bleed_out:.1f}s"
+            status_color = "#ff9f9f"
+        elif self.current_reload_weapon is not None:
+            status_line = "RELOADING..."
+            status_color = "#ffd47e"
+        elif not ammo_cfg["infinite"]:
+            low = self.clip[self.current_weapon] <= max(2, int(ammo_cfg["mag_size"] * 0.2))
+            if low:
+                status_line = "LOW AMMO"
+                status_color = "#ff9a7f"
+
+        self.canvas.create_text(hp_bar_x1, ammo_bar_y1 + 30, anchor="nw", text=status_line, fill=status_color, font=("Consolas", 10, "bold"))
+        self.canvas.create_text(
+            hp_bar_x1,
+            ammo_bar_y1 + 50,
+            anchor="nw",
+            text=f"K {self.player_kills}   D {self.player_deaths}   HS {self.player_headshots}",
+            fill="#d2e6ff",
+            font=("Consolas", 10, "bold"),
+        )
+
+        info_y1 = top_y2 + 10
+        info_y2 = info_y1 + 124
+        self.draw_ui_panel(left_x1, info_y1, left_x2, info_y2)
+        self.canvas.create_text(left_x1 + 14, info_y1 + 10, anchor="nw", text=f"Money  ${self.player_money}", fill="#8ce39e", font=("Consolas", 14, "bold"))
+        self.canvas.create_text(left_x1 + 14, info_y1 + 38, anchor="nw", text=f"Wave {self.wave}   Bots {self.alive_bots()}", fill="#e7eef9", font=("Consolas", 12, "bold"))
+        self.canvas.create_text(
+            left_x1 + 14,
+            info_y1 + 64,
+            anchor="nw",
+            text=f"Level {self.profile_level}   XP {self.profile_xp}/{self.xp_to_next_level()}   Perks {self.perk_points}",
+            fill="#cbe0ff",
+            font=("Consolas", 10, "bold"),
+        )
+        xp_ratio = clamp(self.profile_xp / max(1, self.xp_to_next_level()), 0.0, 1.0)
+        xp_x1 = left_x1 + 14
+        xp_x2 = left_x2 - 14
+        xp_y = info_y2 - 24
+        self.canvas.create_rectangle(xp_x1, xp_y, xp_x2, xp_y + 10, fill="#1b2230", outline="")
+        self.canvas.create_rectangle(xp_x1, xp_y, xp_x1 + (xp_x2 - xp_x1) * xp_ratio, xp_y + 10, fill="#88b9ff", outline="")
+
+        right_x2 = WIDTH - 18
+        right_x1 = max(left_x2 + 12, WIDTH - 430)
+        right_y1 = 16
+        right_y2 = 210
+        self.draw_ui_panel(right_x1, right_y1, right_x2, right_y2)
+
+        objective_text = "Eliminate all bots"
+        if self.objective_type == "defend_zone":
+            objective_text = f"Hold zone {self.objective_timer:.1f}s"
+        self.canvas.create_text(right_x1 + 14, right_y1 + 10, anchor="nw", text="OBJECTIVE", fill="#cbe7ff", font=("Consolas", 12, "bold"))
+        self.canvas.create_text(right_x1 + 14, right_y1 + 36, anchor="nw", text=objective_text, fill="#ecf5ff", font=("Consolas", 13, "bold"))
+        if self.wave_timer > 0:
+            self.canvas.create_text(right_x1 + 14, right_y1 + 62, anchor="nw", text=f"Next wave in {self.wave_timer:.1f}s", fill="#ffe8a1", font=("Consolas", 11, "bold"))
 
         teammate_count = len(self.remote_players) if self.net_mode == "host" else len(self.remote_render_players)
         if self.net_mode != "single":
-            self.canvas.create_text(26, 242, anchor="nw", text=f"Teammates: {teammate_count}", fill="#9cc9ff", font=("Consolas", 16))
-            self.canvas.create_text(26, 268, anchor="nw", text=self.net_status, fill="#9cc9ff", font=("Consolas", 12))
+            self.canvas.create_text(right_x1 + 14, right_y1 + 92, anchor="nw", text=f"Teammates {teammate_count}", fill="#9ecbff", font=("Consolas", 12, "bold"))
+            self.canvas.create_text(right_x1 + 14, right_y1 + 114, anchor="nw", text=self.net_status, fill="#d4e5ff", font=("Consolas", 10))
 
-        objective_text = "Objective: Eliminate all bots"
-        if self.objective_type == "defend_zone":
-            objective_text = f"Objective: Hold zone {self.objective_timer:.1f}s"
         self.canvas.create_text(
-            26,
-            HEIGHT - 108,
+            right_x1 + 14,
+            right_y2 - 26,
             anchor="nw",
-            text=objective_text,
-            fill="#bfe9ff",
-            font=("Consolas", 12, "bold"),
+            text=f"Quality {RAY_COUNT} rays ({'Auto' if self.adaptive_quality_enabled else 'Manual'})",
+            fill="#c1cfde",
+            font=("Consolas", 10),
         )
-        if self.wave_timer > 0:
-            self.canvas.create_text(
-                26,
-                HEIGHT - 128,
-                anchor="nw",
-                text=f"Next wave in {self.wave_timer:.1f}s",
-                fill="#ffe8a1",
-                font=("Consolas", 12, "bold"),
-            )
 
-        help_text = "WASD + Mouse | B Shop | Q Ping | R Reload | Tab Scoreboard | F1-4 Spend Perks"
+        help_text = "WASD + Mouse | B Shop | Q Ping | R Reload | TAB Scoreboard | F1-4 Perks"
         if self.net_mode == "client":
-            help_text = "CO-OP Client | WASD+Mouse -> host | Q Ping | R Reload | Tab Scoreboard | Esc Settings"
+            help_text = "CO-OP Client | WASD+Mouse -> Host | Q Ping | R Reload | TAB Scoreboard | Esc Settings"
         elif self.net_mode == "host":
             money_mode = "Shared $" if self.shared_money else "Split $"
-            help_text = f"CO-OP Host | {money_mode} | Tab Scoreboard | Esc Settings | Others can join via your IP + port"
+            help_text = f"CO-OP Host | {money_mode} | TAB Scoreboard | Esc Settings"
 
-        self.canvas.create_text(
-            WIDTH - 22,
-            24,
-            anchor="ne",
-            text=help_text,
-            fill="#e0e0e0",
-            font=("Consolas", 12),
-        )
-
-        self.canvas.create_text(
-            WIDTH - 22,
-            44,
-            anchor="ne",
-            text=f"Quality: {RAY_COUNT} rays ({'Auto' if self.adaptive_quality_enabled else 'Manual'})",
-            fill="#cfd5de",
-            font=("Consolas", 11),
-        )
+        help_x1 = max(16, WIDTH // 2 - 360)
+        help_x2 = min(WIDTH - 16, WIDTH // 2 + 360)
+        help_y1 = HEIGHT - 40
+        help_y2 = HEIGHT - 10
+        self.draw_ui_panel(help_x1, help_y1, help_x2, help_y2, fill="#121926", outline="#4f6788")
+        self.canvas.create_text((help_x1 + help_x2) / 2, help_y1 + 15, text=help_text, fill="#e4eefb", font=("Consolas", 10, "bold"))
 
         if self.damage_direction_timer > 0.01:
             rel = normalize_angle(self.last_damage_from - self.player_angle)
@@ -2726,9 +2886,33 @@ class FPSBotArena:
             self.render_shop_wheel()
 
         if self.damage_flash > 0:
-            alpha = int(clamp(self.damage_flash * 120, 0, 120))
-            color = rgb(110 + alpha, 18, 18)
-            self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill=color, outline="", stipple="gray50")
+            pulse = clamp(self.damage_flash, 0.0, 1.0)
+            edge_outer = int(18 + pulse * 52)
+            edge_inner = max(8, edge_outer // 2)
+            outer_color = rgb(int(126 + pulse * 96), 22, 22)
+            inner_color = rgb(int(104 + pulse * 72), 20, 20)
+
+            # Edge-only damage vignette keeps center visibility intact.
+            self.canvas.create_rectangle(0, 0, WIDTH, edge_outer, fill=outer_color, outline="", stipple="gray50")
+            self.canvas.create_rectangle(0, HEIGHT - edge_outer, WIDTH, HEIGHT, fill=outer_color, outline="", stipple="gray50")
+            self.canvas.create_rectangle(0, edge_outer, edge_outer, HEIGHT - edge_outer, fill=outer_color, outline="", stipple="gray50")
+            self.canvas.create_rectangle(WIDTH - edge_outer, edge_outer, WIDTH, HEIGHT - edge_outer, fill=outer_color, outline="", stipple="gray50")
+
+            self.canvas.create_rectangle(0, 0, WIDTH, edge_inner, fill=inner_color, outline="", stipple="gray75")
+            self.canvas.create_rectangle(0, HEIGHT - edge_inner, WIDTH, HEIGHT, fill=inner_color, outline="", stipple="gray75")
+            self.canvas.create_rectangle(0, edge_inner, edge_inner, HEIGHT - edge_inner, fill=inner_color, outline="", stipple="gray75")
+            self.canvas.create_rectangle(WIDTH - edge_inner, edge_inner, WIDTH, HEIGHT - edge_inner, fill=inner_color, outline="", stipple="gray75")
+
+            ring_size = int(18 + pulse * 18)
+            ring_color = rgb(int(170 + pulse * 50), 64, 64)
+            self.canvas.create_oval(
+                WIDTH // 2 - ring_size,
+                HALF_HEIGHT - ring_size,
+                WIDTH // 2 + ring_size,
+                HALF_HEIGHT + ring_size,
+                outline=ring_color,
+                width=max(1, int(1 + pulse * 2)),
+            )
 
     def build_scoreboard_rows(self) -> list[tuple[str, int, int, int, int, str, bool]]:
         rows: list[tuple[str, int, int, int, int, str, bool]] = []
@@ -2837,35 +3021,36 @@ class FPSBotArena:
                 self.canvas.create_text(x, row_y, anchor=anchor, text=value, fill=color, font=("Consolas", 11, "bold" if is_local else "normal"))
 
     def render_pause_menu(self) -> None:
-        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#080b12", outline="", stipple="gray50")
+        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#050810", outline="", stipple="gray50")
 
-        panel_w = min(860, WIDTH - 60)
-        panel_h = min(520, HEIGHT - 60)
+        panel_w = min(900, WIDTH - 56)
+        panel_h = min(550, HEIGHT - 56)
         x1 = (WIDTH - panel_w) // 2
         y1 = (HEIGHT - panel_h) // 2
         x2 = x1 + panel_w
         y2 = y1 + panel_h
-        self.canvas.create_rectangle(x1, y1, x2, y2, fill="#151c29", outline="#6f88a8", width=3)
+        self.draw_ui_panel(x1, y1, x2, y2, fill="#111928", outline="#78a2d4")
+        self.canvas.create_rectangle(x1 + 4, y1 + 4, x2 - 4, y1 + 10, fill="#21334d", outline="")
 
         self.canvas.create_text(
             x1 + 28,
             y1 + 22,
             anchor="nw",
-            text="PAUSED | SETTINGS",
-            fill="#edf4ff",
-            font=("Consolas", 26, "bold"),
+            text="PAUSE SETTINGS",
+            fill="#edf5ff",
+            font=("Consolas", 28, "bold"),
         )
         self.canvas.create_text(
             x1 + 30,
             y1 + 64,
             anchor="nw",
-            text="Adjust settings with mouse clicks. Press Esc to resume.",
-            fill="#c6d3e5",
+            text="Tune controls and visuals. Click arrows/toggles, press Esc to resume.",
+            fill="#cad9ee",
             font=("Consolas", 12),
         )
 
-        row_y = y1 + 94
-        row_gap = 52
+        row_y = y1 + 102
+        row_gap = 50
         res_w, res_h = self.available_resolutions[self.resolution_index]
 
         self.draw_pause_adjust_row(
@@ -2971,7 +3156,7 @@ class FPSBotArena:
             anchor="nw",
             text=f"Perks: F1 Vitality {self.perks['vitality']} | F2 Mobility {self.perks['mobility']} | "
             f"F3 Regen {self.perks['regen']} | F4 Weapon {self.perks['weapon']} | Points: {self.perk_points}",
-            fill="#d2e5ff",
+            fill="#d7e8ff",
             font=("Consolas", 10),
         )
 
@@ -2981,7 +3166,7 @@ class FPSBotArena:
                 y2 - 118,
                 anchor="nw",
                 text="Resolution preset applies when fullscreen is Off.",
-                fill="#c6d3e5",
+                fill="#c9d8ea",
                 font=("Consolas", 11),
             )
 
@@ -2990,7 +3175,7 @@ class FPSBotArena:
         button_w = 170
         gap = 24
         start_x = x2 - (button_w * 3 + gap * 2) - 28
-        self.draw_pause_button(start_x, button_y1, start_x + button_w, button_y2, "Defaults", "defaults", "#34506d")
+        self.draw_pause_button(start_x, button_y1, start_x + button_w, button_y2, "Defaults", "defaults", "#2f4963")
         self.draw_pause_button(
             start_x + button_w + gap,
             button_y1,
@@ -2998,7 +3183,7 @@ class FPSBotArena:
             button_y2,
             "Resume",
             "resume",
-            "#2f6d4f",
+            "#2f7158",
         )
         self.draw_pause_button(
             start_x + button_w * 2 + gap * 2,
@@ -3007,7 +3192,7 @@ class FPSBotArena:
             button_y2,
             "Quit",
             "quit",
-            "#7a3737",
+            "#7a3a3a",
         )
 
     def draw_pause_adjust_row(
@@ -3022,7 +3207,7 @@ class FPSBotArena:
         left_label: str = "-",
         right_label: str = "+",
     ) -> None:
-        self.canvas.create_text(panel_x1 + 30, y + 9, anchor="nw", text=label, fill="#ecf3ff", font=("Consolas", 14, "bold"))
+        self.canvas.create_text(panel_x1 + 30, y + 9, anchor="nw", text=label, fill="#edf4ff", font=("Consolas", 14, "bold"))
 
         control_x = panel_x2 - 310
         left_x1 = control_x
@@ -3030,10 +3215,10 @@ class FPSBotArena:
         right_x1 = control_x + 206
         right_x2 = control_x + 294
 
-        self.draw_pause_button(left_x1, y, left_x2, y + 40, left_label, left_action, "#2a3442")
-        self.canvas.create_rectangle(control_x + 94, y, control_x + 200, y + 40, fill="#0f1520", outline="#596c86", width=2)
+        self.draw_pause_button(left_x1, y, left_x2, y + 40, left_label, left_action, "#2a3950")
+        self.canvas.create_rectangle(control_x + 94, y, control_x + 200, y + 40, fill="#0e1622", outline="#617a9f", width=2)
         self.canvas.create_text(control_x + 147, y + 20, text=value, fill="#f7fbff", font=("Consolas", 12, "bold"))
-        self.draw_pause_button(right_x1, y, right_x2, y + 40, right_label, right_action, "#2a3442")
+        self.draw_pause_button(right_x1, y, right_x2, y + 40, right_label, right_action, "#2a3950")
 
     def draw_pause_button(
         self,
@@ -3045,50 +3230,58 @@ class FPSBotArena:
         action: str,
         fill: str,
     ) -> None:
-        self.canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline="#8ca3c3", width=2)
+        self.canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline="#90add1", width=2)
+        self.canvas.create_rectangle(x1, y1, x2, y2, fill="#0d111a", outline="", stipple="gray50")
         self.canvas.create_text((x1 + x2) / 2, (y1 + y2) / 2, text=text, fill="#eef6ff", font=("Consolas", 11, "bold"))
         self.pause_hitboxes.append(PauseHitbox(x1=x1, y1=y1, x2=x2, y2=y2, action=action))
 
     def draw_weapon_bar(self) -> None:
-        y = HEIGHT - 74
-        x = 26
-        for weapon in WEAPON_ORDER:
+        slot_count = len(WEAPON_ORDER)
+        margin_x = 22
+        gap = 10
+        usable_w = WIDTH - margin_x * 2 - gap * (slot_count - 1)
+        slot_w = max(152, int(usable_w / max(1, slot_count)))
+        slot_h = 54
+        y = HEIGHT - 106
+        x = margin_x
+        for idx, weapon in enumerate(WEAPON_ORDER):
             owned = self.owned_weapons[weapon]
             current = weapon == self.current_weapon
-            base_color = "#2a2a2a" if owned else "#1a1a1a"
-            border = "#f0e06a" if current else "#555"
-            self.canvas.create_rectangle(x, y, x + 200, y + 44, fill=base_color, outline=border, width=2)
+            base_color = "#1f2e40" if owned else "#14181f"
+            border = "#f5d57a" if current else "#4f5f76"
+            self.canvas.create_rectangle(x, y, x + slot_w, y + slot_h, fill=base_color, outline=border, width=2)
+            self.canvas.create_rectangle(x, y, x + slot_w, y + slot_h, fill="#0a0f18", outline="", stipple="gray50")
 
             if owned:
-                extra = ""
+                line2 = "Equipped" if current else "Owned"
                 if not WEAPON_DATA[weapon]["infinite"]:
-                    extra = f" ({self.clip[weapon]}/{self.ammo[weapon]})"
-                label = f"{WEAPON_DATA[weapon]['name']}{extra}"
-                color = "#f4f4f4"
+                    line2 = f"Ammo {self.clip[weapon]}/{self.ammo[weapon]}"
+                color = "#ebf4ff"
             else:
-                label = f"{WEAPON_DATA[weapon]['name']} ${WEAPON_DATA[weapon]['cost']}"
-                color = "#8e8e8e"
+                line2 = f"Buy ${WEAPON_DATA[weapon]['cost']}"
+                color = "#8d9db2"
 
-            self.canvas.create_text(x + 100, y + 22, text=label, fill=color, font=("Consolas", 11, "bold"))
-            x += 214
+            self.canvas.create_text(x + 12, y + 10, anchor="nw", text=f"{idx + 1}. {WEAPON_DATA[weapon]['name']}", fill=color, font=("Consolas", 11, "bold"))
+            self.canvas.create_text(x + 12, y + 31, anchor="nw", text=line2, fill=color, font=("Consolas", 10))
+            x += slot_w + gap
 
     def render_shop_wheel(self) -> None:
         cx = WIDTH // 2
         cy = HALF_HEIGHT
         slot = self.shop_slot_from_mouse()
 
-        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#000", outline="", stipple="gray50")
+        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#060b14", outline="", stipple="gray50")
 
-        outer_r = 210
-        inner_r = 70
-        colors = ["#6b6f8f", "#8f6b6b", "#6f8f6b", "#8f834d"]
+        outer_r = 226
+        inner_r = 84
+        colors = ["#436283", "#814c4c", "#3d7451", "#7b6a3e"]
 
         for i, weapon in enumerate(WEAPON_ORDER):
             start = i * 90
             extent = 90
             fill = colors[i]
             if slot == i:
-                fill = "#c6b66f"
+                fill = "#bca566"
 
             self.canvas.create_arc(
                 cx - outer_r,
@@ -3098,8 +3291,8 @@ class FPSBotArena:
                 start=-start,
                 extent=-extent,
                 fill=fill,
-                outline="#1a1a1a",
-                width=2,
+                outline="#121721",
+                width=3,
                 style=tk.PIESLICE,
             )
 
@@ -3117,11 +3310,32 @@ class FPSBotArena:
             else:
                 txt = f"{WEAPON_DATA[weapon]['name']}\n${WEAPON_DATA[weapon]['cost']}"
 
-            self.canvas.create_text(tx, ty, text=txt, fill="#fff", font=("Consolas", 12, "bold"), justify="center")
+            self.canvas.create_text(tx, ty, text=txt, fill="#f6fbff", font=("Consolas", 12, "bold"), justify="center")
 
-        self.canvas.create_oval(cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r, fill="#101018", outline="#ddd", width=2)
-        self.canvas.create_text(cx, cy - 8, text="SHOP", fill="#fff", font=("Consolas", 16, "bold"))
-        self.canvas.create_text(cx, cy + 14, text="Click to buy/equip", fill="#ddd", font=("Consolas", 10))
+        self.canvas.create_oval(cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r, fill="#101827", outline="#d0deef", width=2)
+        self.canvas.create_text(cx, cy - 12, text="ARMORY", fill="#ffffff", font=("Consolas", 16, "bold"))
+        self.canvas.create_text(cx, cy + 12, text="Click to buy/equip", fill="#d3deed", font=("Consolas", 10))
+
+        focus_index = slot if slot is not None else WEAPON_ORDER.index(self.current_weapon)
+        focus_weapon = WEAPON_ORDER[focus_index]
+        focus_cfg = WEAPON_DATA[focus_weapon]
+        panel_w = 340
+        panel_h = 96
+        px1 = cx - panel_w // 2
+        py1 = cy + outer_r + 14
+        px2 = cx + panel_w // 2
+        py2 = py1 + panel_h
+        if py2 < HEIGHT - 12:
+            self.draw_ui_panel(px1, py1, px2, py2, fill="#111a28", outline="#7fa3cf")
+            owned = self.owned_weapons[focus_weapon]
+            if focus_cfg["infinite"]:
+                ammo_line = "Ammo: Infinite"
+            else:
+                ammo_line = f"Ammo: {self.clip[focus_weapon]}/{self.ammo[focus_weapon]}  Pack +{focus_cfg['ammo_pack']}"
+            status = "Owned" if owned else f"Price: ${focus_cfg['cost']}"
+            self.canvas.create_text(px1 + 14, py1 + 12, anchor="nw", text=f"{focus_cfg['name']}  [{focus_weapon.upper()}]", fill="#eff5ff", font=("Consolas", 12, "bold"))
+            self.canvas.create_text(px1 + 14, py1 + 36, anchor="nw", text=status, fill="#9dd7a9" if owned else "#ffd49b", font=("Consolas", 11, "bold"))
+            self.canvas.create_text(px1 + 14, py1 + 58, anchor="nw", text=ammo_line, fill="#d4e0f0", font=("Consolas", 10))
 
     def render_glitch_overlay(self) -> None:
         self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#091327", outline="", stipple="gray50")
