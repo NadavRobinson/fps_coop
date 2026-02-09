@@ -200,7 +200,7 @@ class FPSBotArena:
         self.perk_points = 0
         self.attachment_tier = 0
         self.perks = {"vitality": 0, "mobility": 0, "regen": 0, "weapon": 0}
-        self.remote_interp_targets: dict[str, tuple[float, float, float, float, str, bool, str]] = {}
+        self.remote_interp_targets: dict[str, tuple[float, float, float, float, str, bool, str, int, int, int, int]] = {}
         self.remote_render_map: dict[str, TeammateView] = {}
         self.wave_cleared_award_pending = False
 
@@ -232,6 +232,9 @@ class FPSBotArena:
         self.player_angle = 0.15
         self.player_health = self.get_max_health_cap()
         self.player_money = 0
+        self.player_kills = 0
+        self.player_deaths = 0
+        self.player_headshots = 0
         self.player_downed = False
         self.player_bleed_out = 0.0
         self.player_revive_progress = 0.0
@@ -289,6 +292,9 @@ class FPSBotArena:
                 remote.downed = False
                 remote.bleed_out = 0.0
                 remote.revive_progress = 0.0
+                remote.kills = 0
+                remote.deaths = 0
+                remote.headshots = 0
 
         if self.net_mode != "client":
             self.spawn_wave()
@@ -676,6 +682,9 @@ class FPSBotArena:
         self.player_health = float(you.get("health", self.player_health))
         self.player_downed = bool(you.get("downed", self.player_downed))
         self.player_money = int(you.get("money", self.player_money))
+        self.player_kills = int(you.get("kills", self.player_kills))
+        self.player_deaths = int(you.get("deaths", self.player_deaths))
+        self.player_headshots = int(you.get("headshots", self.player_headshots))
         self.current_weapon = str(you.get("weapon", self.current_weapon))
 
         ammo_data = you.get("ammo")
@@ -765,11 +774,40 @@ class FPSBotArena:
             th = float(item.get("health", 0.0))
             tw = str(item.get("weapon", "pistol"))
             tn = str(item.get("name", "Teammate"))
-            td = bool(item.get("downed", False))
-            self.remote_interp_targets[player_id] = (tx, ty, ta, th, tw, td, tn)
+            tdowned = bool(item.get("downed", False))
+            tmoney = int(item.get("money", 0))
+            tkills = int(item.get("kills", 0))
+            tdeaths = int(item.get("deaths", 0))
+            theadshots = int(item.get("headshots", 0))
+            self.remote_interp_targets[player_id] = (
+                tx,
+                ty,
+                ta,
+                th,
+                tw,
+                tdowned,
+                tn,
+                tmoney,
+                tkills,
+                tdeaths,
+                theadshots,
+            )
             view = self.remote_render_map.get(player_id)
             if view is None:
-                view = TeammateView(player_id=player_id, name=tn, x=tx, y=ty, angle=ta, health=th, weapon=tw, downed=td)
+                view = TeammateView(
+                    player_id=player_id,
+                    name=tn,
+                    x=tx,
+                    y=ty,
+                    angle=ta,
+                    health=th,
+                    weapon=tw,
+                    downed=tdowned,
+                    money=tmoney,
+                    kills=tkills,
+                    deaths=tdeaths,
+                    headshots=theadshots,
+                )
                 self.remote_render_map[player_id] = view
             seen.add(player_id)
 
@@ -790,7 +828,7 @@ class FPSBotArena:
             target = self.remote_interp_targets.get(player_id)
             if target is None:
                 continue
-            tx, ty, ta, th, tw, td, tn = target
+            tx, ty, ta, th, tw, tdowned, tn, tmoney, tkills, tdeaths, theadshots = target
             view.x += (tx - view.x) * blend
             view.y += (ty - view.y) * blend
             da = normalize_angle(ta - view.angle)
@@ -800,7 +838,11 @@ class FPSBotArena:
             view.health = th
             view.weapon = tw
             view.name = tn
-            view.downed = td
+            view.downed = tdowned
+            view.money = tmoney
+            view.kills = tkills
+            view.deaths = tdeaths
+            view.headshots = theadshots
         self.remote_render_players = list(self.remote_render_map.values())
 
     def send_client_input(self, now: float) -> None:
@@ -837,6 +879,9 @@ class FPSBotArena:
             "health": remote.health,
             "downed": remote.downed,
             "money": remote.money,
+            "kills": remote.kills,
+            "deaths": remote.deaths,
+            "headshots": remote.headshots,
             "weapon": remote.current_weapon,
             "ammo": dict(remote.ammo),
             "clip": dict(remote.clip),
@@ -853,6 +898,9 @@ class FPSBotArena:
             "health": self.player_health,
             "downed": self.player_downed,
             "money": self.player_money,
+            "kills": self.player_kills,
+            "deaths": self.player_deaths,
+            "headshots": self.player_headshots,
             "weapon": self.current_weapon,
             "ammo": dict(self.ammo),
             "clip": dict(self.clip),
@@ -1022,12 +1070,12 @@ class FPSBotArena:
 
         for _ in range(config["pellets"]):
             shot_angle = remote.angle + random.uniform(-config["spread"], config["spread"])
-            target, _ = self.get_first_bot_hit_from(remote.x, remote.y, shot_angle, config["range"])
+            target, headshot = self.get_first_bot_hit_from(remote.x, remote.y, shot_angle, config["range"])
             if target is None:
                 continue
             target.health -= config["damage"]
             if target.health <= 0 and target.alive:
-                self.kill_bot(target)
+                self.kill_bot(target, killer_id=remote.player_id, headshot=headshot)
 
         if not config["infinite"] and remote.clip[weapon] <= 0 and remote.ammo[weapon] <= 0:
             remote.current_weapon = "pistol"
@@ -1597,6 +1645,7 @@ class FPSBotArena:
             self.player_downed = True
             self.player_bleed_out = 14.0
             self.player_health = 1.0
+            self.player_deaths += 1
 
     def apply_damage_to_remote(self, remote: RemotePlayer, dmg: float, source_x: float, source_y: float) -> None:
         _ = source_x
@@ -1614,6 +1663,7 @@ class FPSBotArena:
             remote.downed = True
             remote.bleed_out = 14.0
             remote.health = 1.0
+            remote.deaths += 1
 
     def award_money(self, collector_id: str, amount: int) -> None:
         if amount <= 0:
@@ -1960,7 +2010,7 @@ class FPSBotArena:
                 dmg *= 1.7
             target.health -= dmg
             if target.health <= 0 and target.alive:
-                self.kill_bot(target)
+                self.kill_bot(target, killer_id="host", headshot=headshot)
 
         if not config["infinite"]:
             if self.clip[weapon] <= 0:
@@ -2006,7 +2056,22 @@ class FPSBotArena:
     def get_first_bot_hit(self, shot_angle: float, max_range: float) -> tuple[Bot | None, bool]:
         return self.get_first_bot_hit_from(self.player_x, self.player_y, shot_angle, max_range)
 
-    def kill_bot(self, bot: Bot) -> None:
+    def add_player_kill(self, killer_id: str, headshot: bool) -> None:
+        if killer_id == "host":
+            self.player_kills += 1
+            if headshot:
+                self.player_headshots += 1
+            return
+
+        remote = self.remote_players.get(killer_id)
+        if remote is None:
+            return
+        remote.kills += 1
+        if headshot:
+            remote.headshots += 1
+
+    def kill_bot(self, bot: Bot, killer_id: str = "host", headshot: bool = False) -> None:
+        self.add_player_kill(killer_id, headshot)
         bot.alive = False
         self.gain_xp(int(10 + self.wave * 0.8 + bot.money_multiplier * 4))
         money_count = 1 if random.random() < 0.75 else 2
@@ -2275,6 +2340,9 @@ class FPSBotArena:
         elif self.game_state == "dead":
             self.render_dead_overlay()
 
+        if not self.pause_open and "tab" in self.keys:
+            self.render_scoreboard_overlay()
+
         if self.pause_open:
             self.render_pause_menu()
 
@@ -2341,6 +2409,10 @@ class FPSBotArena:
                         health=remote.health,
                         weapon=remote.current_weapon,
                         downed=remote.downed,
+                        money=remote.money,
+                        kills=remote.kills,
+                        deaths=remote.deaths,
+                        headshots=remote.headshots,
                     )
                 )
         else:
@@ -2612,12 +2684,12 @@ class FPSBotArena:
                 font=("Consolas", 12, "bold"),
             )
 
-        help_text = "WASD + Mouse | B Shop | Q Ping | R Reload | F1-4 Spend Perks"
+        help_text = "WASD + Mouse | B Shop | Q Ping | R Reload | Tab Scoreboard | F1-4 Spend Perks"
         if self.net_mode == "client":
-            help_text = "CO-OP Client | WASD+Mouse -> host | Q Ping | R Reload | Esc Settings"
+            help_text = "CO-OP Client | WASD+Mouse -> host | Q Ping | R Reload | Tab Scoreboard | Esc Settings"
         elif self.net_mode == "host":
             money_mode = "Shared $" if self.shared_money else "Split $"
-            help_text = f"CO-OP Host | {money_mode} | Esc Settings | Others can join via your IP + port"
+            help_text = f"CO-OP Host | {money_mode} | Tab Scoreboard | Esc Settings | Others can join via your IP + port"
 
         self.canvas.create_text(
             WIDTH - 22,
@@ -2657,6 +2729,112 @@ class FPSBotArena:
             alpha = int(clamp(self.damage_flash * 120, 0, 120))
             color = rgb(110 + alpha, 18, 18)
             self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill=color, outline="", stipple="gray50")
+
+    def build_scoreboard_rows(self) -> list[tuple[str, int, int, int, int, str, bool]]:
+        rows: list[tuple[str, int, int, int, int, str, bool]] = []
+        local_hp = "DOWN" if self.player_downed else str(max(0, int(self.player_health)))
+        rows.append(
+            (
+                self.player_name,
+                self.player_kills,
+                self.player_deaths,
+                self.player_headshots,
+                self.player_money,
+                local_hp,
+                True,
+            )
+        )
+
+        if self.net_mode == "host":
+            for remote in self.remote_players.values():
+                hp = "DOWN" if remote.downed else str(max(0, int(remote.health)))
+                rows.append((remote.name, remote.kills, remote.deaths, remote.headshots, remote.money, hp, False))
+        elif self.net_mode == "client":
+            for teammate in self.remote_render_players:
+                hp = "DOWN" if teammate.downed else str(max(0, int(teammate.health)))
+                rows.append(
+                    (
+                        teammate.name,
+                        teammate.kills,
+                        teammate.deaths,
+                        teammate.headshots,
+                        teammate.money,
+                        hp,
+                        False,
+                    )
+                )
+
+        if len(rows) > 1:
+            others = rows[1:]
+            others.sort(key=lambda item: (-item[1], item[2], item[0].lower()))
+            rows = [rows[0]] + others
+        return rows
+
+    def render_scoreboard_overlay(self) -> None:
+        rows = self.build_scoreboard_rows()
+        row_height = 30
+        panel_w = min(900, max(620, WIDTH - 80))
+        panel_h = min(HEIGHT - 80, 110 + row_height * max(1, len(rows)))
+        x1 = (WIDTH - panel_w) // 2
+        y1 = (HEIGHT - panel_h) // 2
+        x2 = x1 + panel_w
+        y2 = y1 + panel_h
+
+        self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#05070d", outline="", stipple="gray50")
+        self.canvas.create_rectangle(x1, y1, x2, y2, fill="#101722", outline="#88a7cf", width=2)
+        self.canvas.create_text(
+            x1 + 24,
+            y1 + 18,
+            anchor="nw",
+            text="SCOREBOARD",
+            fill="#e5f0ff",
+            font=("Consolas", 20, "bold"),
+        )
+        self.canvas.create_text(
+            x2 - 24,
+            y1 + 22,
+            anchor="ne",
+            text="Hold TAB",
+            fill="#b2c8e8",
+            font=("Consolas", 11),
+        )
+
+        cols = [
+            ("Player", x1 + 24, "w"),
+            ("Kills", x1 + int(panel_w * 0.56), "e"),
+            ("Deaths", x1 + int(panel_w * 0.66), "e"),
+            ("Headshots", x1 + int(panel_w * 0.78), "e"),
+            ("Money", x1 + int(panel_w * 0.9), "e"),
+            ("HP", x2 - 24, "e"),
+        ]
+        header_y = y1 + 54
+        self.canvas.create_line(x1 + 18, header_y + 16, x2 - 18, header_y + 16, fill="#496181", width=1)
+        for label, x, anchor in cols:
+            self.canvas.create_text(x, header_y, anchor=anchor, text=label, fill="#a9c3e5", font=("Consolas", 11, "bold"))
+
+        start_y = header_y + 32
+        for idx, row in enumerate(rows):
+            name, kills, deaths, headshots, money, hp, is_local = row
+            row_y = start_y + idx * row_height
+            if row_y + 14 > y2 - 8:
+                break
+
+            if idx % 2 == 0:
+                self.canvas.create_rectangle(x1 + 16, row_y - 11, x2 - 16, row_y + 11, fill="#16202d", outline="")
+
+            if is_local:
+                self.canvas.create_rectangle(x1 + 16, row_y - 11, x2 - 16, row_y + 11, outline="#7cc6ff", width=1)
+                display_name = f"{name} (YOU)"
+            else:
+                display_name = name
+
+            values = [display_name, str(kills), str(deaths), str(headshots), f"${money}", hp]
+            for col_idx, value in enumerate(values):
+                _label, x, anchor = cols[col_idx]
+                color = "#eaf3ff" if is_local else "#d3deec"
+                if col_idx == 5 and hp == "DOWN":
+                    color = "#ffadad"
+                self.canvas.create_text(x, row_y, anchor=anchor, text=value, fill=color, font=("Consolas", 11, "bold" if is_local else "normal"))
 
     def render_pause_menu(self) -> None:
         self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill="#080b12", outline="", stipple="gray50")

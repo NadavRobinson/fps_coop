@@ -55,6 +55,9 @@ class RemotePlayer:
     downed: bool = False
     bleed_out: float = 0.0
     revive_progress: float = 0.0
+    kills: int = 0
+    deaths: int = 0
+    headshots: int = 0
 
 
 @dataclass
@@ -67,6 +70,10 @@ class TeammateView:
     health: float
     weapon: str
     downed: bool = False
+    money: int = 0
+    kills: int = 0
+    deaths: int = 0
+    headshots: int = 0
 
 
 @dataclass
